@@ -35,7 +35,6 @@ app.get('/api/district-details/:id', async (req, res) => {
     
     res.json({
       description: row.description,
-      // Возвращаем массив картинок (в районах обычно одна, но для структуры слайдера сделаем массив)
       images: row.photo_binary ? [row.photo_binary.toString('base64')] : []
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -119,14 +118,14 @@ app.get('/api/explore', async (req, res) => {
 // Получение точек маршрута
 app.get('/api/route-points/:id', async (req, res) => {
   try {
-    const desc = await pool.query('SELECT description_text FROM routes WHERE id_route = $1', [req.params.id]);
+    const desc = await pool.query('SELECT description FROM routes WHERE id_route = $1', [req.params.id]);
     const points = await pool.query(`
       SELECT ST_Y(p.location::geometry) as lat, ST_X(p.location::geometry) as lon, p.name_place 
       FROM places p JOIN place_and_route par ON p.id_place = par.place_id 
       WHERE par.route_id = $1 ORDER BY par.order_number`, [req.params.id]);
     
     res.json({
-      description: desc.rows[0]?.description_text,
+      description: desc.rows[0]?.description,
       points: points.rows
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
