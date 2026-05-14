@@ -174,18 +174,45 @@ app.get('/api/route-points/:id', async (req, res) => {
         return res.json({ description: desc.rows[0]?.description, points, geometry: [] });
     }
 
-    const osrmCoords = points.map(p => `${p.lon},${p.lat}`).join(';');
-    const osrmUrl = `http://router.project-osrm.org/route/v1/foot/${osrmCoords}?overview=full&geometries=geojson&continue_straight=false`;
-    
-    const osrmRes = await axios.get(osrmUrl);
-    const roadGeometry = osrmRes.data.routes[0].geometry.coordinates; 
+    const coordsForORS = points.map(p => [parseFloat(p.lon), parseFloat(p.lat)]);
 
-    res.json({
-      description: desc.rows[0]?.description,
-      points: points, 
-      roadPath: roadGeometry.map(c => ({ lat: c[1], lon: c[0] })) 
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    try {
+      // Запрос к OpenRouteService (пешеходный профиль)
+      const orsResponse = await axios.post(
+        'https://api.openrouteservice.org/v2/directions/foot-walking/geojson',
+        {
+          coordinates: coordsForORS,
+          language: "ru",
+          preference: "shortest"
+        },
+        {
+          headers: {
+            'Authorization': process.env.ORS_API_KEY, 
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      const roadGeometry = orsResponse.data.features[0].geometry.coordinates;
+
+      res.json({
+        description: desc.rows[0]?.description,
+        points: points, 
+        roadPath: roadGeometry.map(c => ({ lat: c[1], lon: c[0] })) // Превращаем [lon, lat] в {lat, lon}
+      });
+
+    } catch (orsError) {
+      console.error("ORS API Error:", orsError.response ? orsError.response.data : orsError.message);
+      res.json({
+        description: desc.rows[0]?.description,
+        points: points,
+        roadPath: [] 
+      });
+    }
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
