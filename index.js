@@ -231,4 +231,17 @@ app.get('/api/get-path', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/profile/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT fio FROM users WHERE id_user = $1', [req.params.id]);
+    if (result.rows.length > 0) {
+      res.json({ name: result.rows[0].fio });
+    } else {
+      res.status(404).json({ error: "Пользователь не найден" });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
