@@ -3,6 +3,7 @@ const { Pool } = require('pg');
 const sharp = require('sharp'); 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const axios = require('axios');
 
 // Подключение к БД
 const pool = new Pool({
@@ -16,14 +17,22 @@ const formatRows = async (rows, width = 300) => {
     for (let key in newRow) {
       if (Buffer.isBuffer(newRow[key])) {
         try {
-          // Сжимаем фото: меняем размер, ставим качество 70%, конвертируем в JPEG
-          const resizedBuffer = await sharp(newRow[key])
-            .resize(width) 
-            .jpeg({ quality: 70 })
-            .toBuffer();
-          newRow[key] = resizedBuffer.toString('base64');
+          let pipeline = sharp(newRow[key])
+            .resize(width, null, {
+              fit: 'inside',     
+              withoutEnlargement: true 
+            });
+
+          if (width <= 200) {
+            const buffer = await pipeline.png().toBuffer();
+            newRow[key] = buffer.toString('base64');
+          } else {
+            const buffer = await pipeline.webp({ quality: 70 }).toBuffer();
+            newRow[key] = buffer.toString('base64');
+          }
         } catch (e) {
-          newRow[key] = null; // Если файл в БД битый
+          console.error("Ошибка обработки изображения:", e);
+          newRow[key] = null; 
         }
       }
     }
@@ -51,7 +60,7 @@ app.get('/api/main-data', async (req, res) => {
       
     const nearbyPromise = pool.query(nearbySql, [`%${searchCity}%`]);
     const [districtsRes, nearbyRes] = await Promise.all([districtsPromise, nearbyPromise]);
-    const compressedDistricts = await formatRows(districtsRes.rows, 100);
+    const compressedDistricts = await formatRows(districtsRes.rows, 150);
     const compressedNearby = await formatRows(nearbyRes.rows, 350);
 
     res.json({
@@ -148,18 +157,28 @@ app.get('/api/explore', async (req, res) => {
 app.get('/api/route-points/:id', async (req, res) => {
   try {
     const desc = await pool.query('SELECT description FROM routes WHERE id_route = $1', [req.params.id]);
-    const points = await pool.query(`
+    const pointsRes = await pool.query(`
       SELECT ST_Y(p.location::geometry) as lat, ST_X(p.location::geometry) as lon, p.name_place 
       FROM places p JOIN place_and_route par ON p.id_place = par.place_id 
       WHERE par.route_id = $1 ORDER BY par.order_number`, [req.params.id]);
     
+    const points = pointsRes.rows;
+    if (points.length < 2) {
+        return res.json({ description: desc.rows[0]?.description, points, geometry: [] });
+    }
+
+    const osrmCoords = points.map(p => `${p.lon},${p.lat}`).join(';');
+    const osrmUrl = `http://router.project-osrm.org/route/v1/foot/${osrmCoords}?overview=full&geometries=geojson`;
+    
+    const osrmRes = await axios.get(osrmUrl);
+    const roadGeometry = osrmRes.data.routes[0].geometry.coordinates; 
+
     res.json({
       description: desc.rows[0]?.description,
-      points: points.rows
+      points: points, 
+      roadPath: roadGeometry.map(c => ({ lat: c[1], lon: c[0] })) 
     });
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
