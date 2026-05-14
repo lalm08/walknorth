@@ -51,7 +51,7 @@ app.get('/api/main-data', async (req, res) => {
       
     const nearbyPromise = pool.query(nearbySql, [`%${searchCity}%`]);
     const [districtsRes, nearbyRes] = await Promise.all([districtsPromise, nearbyPromise]);
-    const compressedDistricts = await formatRows(districtsRes.rows, 150);
+    const compressedDistricts = await formatRows(districtsRes.rows, 100);
     const compressedNearby = await formatRows(nearbyRes.rows, 350);
 
     res.json({
