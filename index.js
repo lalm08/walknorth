@@ -1,5 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
+const sharp = require('sharp'); 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -9,22 +10,33 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const formatRows = (rows) => {
-  return rows.map(row => {
+const formatRows = async (rows, width = 300) => {
+  return await Promise.all(rows.map(async (row) => {
     const newRow = { ...row };
     for (let key in newRow) {
       if (Buffer.isBuffer(newRow[key])) {
-        newRow[key] = newRow[key].toString('base64');
+        try {
+          // Сжимаем фото: меняем размер, ставим качество 70%, конвертируем в JPEG
+          const resizedBuffer = await sharp(newRow[key])
+            .resize(width) 
+            .jpeg({ quality: 70 })
+            .toBuffer();
+          newRow[key] = resizedBuffer.toString('base64');
+        } catch (e) {
+          newRow[key] = null; // Если файл в БД битый
+        }
       }
     }
     return newRow;
-  });
+  }));
 };
+
 //список районов
 app.get('/api/districts', async (req, res) => {
   try {
     const result = await pool.query('SELECT id_district, name_district, photo_binary FROM districts ORDER BY name_district');
-    res.json(formatRows(result.rows));
+    const data = await formatRows(result.rows, 200);
+    res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -49,7 +61,8 @@ app.get('/api/nearby', async (req, res) => {
                  JOIN districts d ON p.district_id = d.id_district 
                  WHERE d.name_district = $1 LIMIT 5`;
     const result = await pool.query(sql, [cityName]);
-    res.json(formatRows(result.rows));
+    const data = await formatRows(result.rows, 300);
+    res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -64,7 +77,8 @@ app.get('/api/tours', async (req, res) => {
                  JOIN places p ON par.place_id = p.id_place
                  WHERE p.district_id = $1`;
     const result = await pool.query(sql, [districtId]);
-    res.json(result.rows);
+    const data = await formatRows(result.rows, 400);
+    res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -73,14 +87,16 @@ app.get('/api/place-details/:id', async (req, res) => {
   try {
     const info = await pool.query('SELECT description, ST_Y(location::geometry) as lat, ST_X(location::geometry) as lon FROM places WHERE id_place = $1', [req.params.id]);
     const photos = await pool.query('SELECT photo_binary FROM photos WHERE place_id = $1', [req.params.id]);
-    
+    const compressedPhotos = await formatRows(photos.rows, 800);
     res.json({
       description: info.rows[0]?.description,
       lat: info.rows[0]?.lat,
       lon: info.rows[0]?.lon,
-      images: photos.rows.map(p => p.photo_binary.toString('base64'))
+      images: compressedPhotos.map(p => p.photo_binary)
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // Получение списка 
@@ -111,8 +127,11 @@ app.get('/api/explore', async (req, res) => {
 
   try {
     const result = await pool.query(sql, params);
-    res.json(formatRows(result.rows));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const data = await formatRows(result.rows, 300);
+    res.json(data);
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // Получение точек маршрута
@@ -128,7 +147,9 @@ app.get('/api/route-points/:id', async (req, res) => {
       description: desc.rows[0]?.description,
       points: points.rows
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
