@@ -72,6 +72,13 @@ app.get('/api/main-data', async (req, res) => {
   }
 });
 
+app.get('/api/districts', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id_district, name_district FROM districts ORDER BY name_district');
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/district-details/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT description, photo_binary FROM districts WHERE id_district = $1', [req.params.id]);
@@ -168,7 +175,7 @@ app.get('/api/route-points/:id', async (req, res) => {
     }
 
     const osrmCoords = points.map(p => `${p.lon},${p.lat}`).join(';');
-    const osrmUrl = `http://router.project-osrm.org/route/v1/foot/${osrmCoords}?overview=full&geometries=geojson`;
+    const osrmUrl = `http://router.project-osrm.org/route/v1/foot/${osrmCoords}?overview=full&geometries=geojson&continue_straight=false`;
     
     const osrmRes = await axios.get(osrmUrl);
     const roadGeometry = osrmRes.data.routes[0].geometry.coordinates; 
