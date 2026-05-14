@@ -215,4 +215,20 @@ app.get('/api/route-points/:id', async (req, res) => {
   }
 });
 
+app.get('/api/get-path', async (req, res) => {
+  const { startLat, startLon, endLat, endLon } = req.query;
+  try {
+    const orsUrl = 'https://api.openrouteservice.org/v2/directions/foot-walking/geojson';
+    const orsRes = await axios.post(orsUrl, {
+      coordinates: [[startLon, startLat], [endLon, endLat]],
+      language: "ru"
+    }, {
+      headers: { 'Authorization': process.env.ORS_API_KEY, 'Content-Type': 'application/json' }
+    });
+
+    const roadGeometry = orsRes.data.features[0].geometry.coordinates;
+    res.json(roadGeometry.map(c => ({ lat: c[1], lon: c[0] })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
