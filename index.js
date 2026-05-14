@@ -31,13 +31,36 @@ const formatRows = async (rows, width = 300) => {
   }));
 };
 
-//список районов
-app.get('/api/districts', async (req, res) => {
+app.get('/api/main-data', async (req, res) => {
+  const { cityName } = req.query;
+  const searchCity = cityName || 'Сыктывкар'; 
+
   try {
-    const result = await pool.query('SELECT id_district, name_district, photo_binary FROM districts ORDER BY name_district');
-    const data = await formatRows(result.rows, 200);
-    res.json(data);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const districtsPromise = pool.query('SELECT id_district, name_district, photo_binary FROM districts ORDER BY name_district');
+    
+    const nearbySql = `
+      SELECT * FROM (
+        SELECT DISTINCT ON (p.id_place) p.id_place, p.name_place, ph.photo_binary 
+        FROM places p 
+        JOIN photos ph ON p.id_place = ph.place_id 
+        JOIN districts d ON p.district_id = d.id_district 
+        WHERE d.name_district ILIKE $1
+      ) as subquery
+      ORDER BY RANDOM() 
+      LIMIT 5`;
+      
+    const nearbyPromise = pool.query(nearbySql, [`%${searchCity}%`]);
+    const [districtsRes, nearbyRes] = await Promise.all([districtsPromise, nearbyPromise]);
+    const compressedDistricts = await formatRows(districtsRes.rows, 150);
+    const compressedNearby = await formatRows(nearbyRes.rows, 350);
+
+    res.json({
+      districts: compressedDistricts,
+      nearby: compressedNearby
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/district-details/:id', async (req, res) => {
@@ -52,19 +75,6 @@ app.get('/api/district-details/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// места рядом
-app.get('/api/nearby', async (req, res) => {
-  const { cityName } = req.query;
-  try {
-    const sql = `SELECT DISTINCT ON (p.id_place) p.id_place, p.name_place, ph.photo_binary 
-                 FROM places p JOIN photos ph ON p.id_place = ph.place_id 
-                 JOIN districts d ON p.district_id = d.id_district 
-                 WHERE d.name_district = $1 LIMIT 5`;
-    const result = await pool.query(sql, [cityName]);
-    const data = await formatRows(result.rows, 300);
-    res.json(data);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
 //туры по району 
 app.get('/api/tours', async (req, res) => {
