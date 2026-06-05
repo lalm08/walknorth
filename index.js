@@ -103,11 +103,119 @@ app.get('/api/tours', async (req, res) => {
                  JOIN routes r ON rat.route_id = r.id_route
                  JOIN place_and_route par ON r.id_route = par.route_id
                  JOIN places p ON par.place_id = p.id_place
-                 WHERE p.district_id = $1`;
+                 WHERE p.district_id = $1
+                 ORDER BY t.name_tour`;
     const result = await pool.query(sql, [districtId]);
-    const data = await formatRows(result.rows, 400);
-    res.json(data);
+    res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// детали тура: описание, места, отзывы, избранное
+app.get('/api/tour-details/:id', async (req, res) => {
+  const tourId = req.params.id;
+  const userId = req.query.userId;
+
+  try {
+    const tourRes = await pool.query(
+      'SELECT id_tour, name_tour, description, price FROM tours WHERE id_tour = $1',
+      [tourId]
+    );
+    if (tourRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Тур не найден' });
+    }
+
+    const placesRes = await pool.query(
+      `SELECT DISTINCT p.id_place, p.name_place
+       FROM tours t
+       JOIN route_and_tour rat ON t.id_tour = rat.tour_id
+       JOIN routes r ON rat.route_id = r.id_route
+       JOIN place_and_route par ON r.id_route = par.route_id
+       JOIN places p ON par.place_id = p.id_place
+       WHERE t.id_tour = $1
+       ORDER BY p.name_place`,
+      [tourId]
+    );
+
+    let reviews = [];
+    let avgRating = 0;
+    try {
+      const reviewsRes = await pool.query(
+        `SELECT u.fio AS user_name, rev.rating, rev.text_review AS text
+         FROM reviews rev
+         JOIN users u ON rev.user_id = u.id_user
+         WHERE rev.tour_id = $1
+         ORDER BY rev.id_review DESC`,
+        [tourId]
+      );
+      reviews = reviewsRes.rows;
+      if (reviews.length > 0) {
+        avgRating = reviews.reduce((sum, r) => sum + Number(r.rating), 0) / reviews.length;
+        avgRating = Math.round(avgRating * 10) / 10;
+      }
+    } catch (reviewErr) {
+      console.warn('Reviews unavailable:', reviewErr.message);
+    }
+
+    let isFavorite = false;
+    if (userId && userId !== '-1') {
+      const favRes = await pool.query(
+        'SELECT id_favorite FROM favorites WHERE user_id = $1 AND tour_id = $2',
+        [userId, tourId]
+      );
+      isFavorite = favRes.rows.length > 0;
+    }
+
+    const tour = tourRes.rows[0];
+    res.json({
+      id: tour.id_tour,
+      name: tour.name_tour,
+      description: tour.description,
+      price: tour.price,
+      places: placesRes.rows.map(p => ({ id: p.id_place, name: p.name_place })),
+      reviews,
+      avgRating,
+      isFavorite
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/favorites/toggle', async (req, res) => {
+  const { userId, tourId } = req.body;
+  if (!userId || userId === -1 || !tourId) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+  try {
+    const existing = await pool.query(
+      'SELECT id_favorite FROM favorites WHERE user_id = $1 AND tour_id = $2',
+      [userId, tourId]
+    );
+    if (existing.rows.length > 0) {
+      await pool.query('DELETE FROM favorites WHERE user_id = $1 AND tour_id = $2', [userId, tourId]);
+      return res.json({ success: true, isFavorite: false });
+    }
+    await pool.query('INSERT INTO favorites (user_id, tour_id) VALUES ($1, $2)', [userId, tourId]);
+    res.json({ success: true, isFavorite: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/favorites/:userId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT t.id_tour AS id, t.name_tour AS name, t.price
+       FROM favorites f
+       JOIN tours t ON f.tour_id = t.id_tour
+       WHERE f.user_id = $1
+       ORDER BY t.name_tour`,
+      [req.params.userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 //детали места 
