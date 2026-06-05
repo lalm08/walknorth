@@ -5,6 +5,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const axios = require('axios');
 
+app.use(express.json());
+
 // Подключение к БД
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -238,6 +240,47 @@ app.get('/api/profile/:id', async (req, res) => {
       res.json({ name: result.rows[0].fio });
     } else {
       res.status(404).json({ error: "Пользователь не найден" });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// РЕГИСТРАЦИЯ
+app.post('/api/register', async (req, res) => {
+  const { fio, login, mail, phone, pass } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO users (fio, login, mail, phone, pass, role_id, created) 
+       VALUES ($1, $2, $3, $4, $5, 1, CURRENT_TIMESTAMP) RETURNING id_user`,
+      [fio, login, mail, phone, pass]
+    );
+    res.json({ success: true, userId: result.rows[0].id_user });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Ошибка регистрации." });
+  }
+});
+
+// ВХОД
+app.post('/api/login', async (req, res) => {
+  const { login, pass } = req.body;
+  try {
+    const result = await pool.query(
+      'SELECT id_user, fio, role_id FROM users WHERE login = $1 AND pass = $2',
+      [login, pass]
+    );
+
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+      res.json({ 
+        success: true, 
+        userId: user.id_user, 
+        roleId: user.role_id,
+        name: user.fio
+      });
+    } else {
+      res.status(401).json({ error: "Неверный логин или пароль" });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
