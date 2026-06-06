@@ -146,48 +146,139 @@ async function getRoutePathFromDb(routeId) {
   return [];
 }
 
+function normalizeScheduleRows(rows) {
+  return rows.map(r => ({
+    id: r.id_tour_schedule ?? r.id_schedule ?? r.schedule_id ?? r.id,
+    id_tour_schedule: r.id_tour_schedule ?? r.id_schedule ?? r.schedule_id ?? r.id,
+    datetime_start: r.datetime_start ?? r.date_start ?? r.start_date ?? r.start_time ?? r.datetime,
+    datetime_end: r.datetime_end ?? r.date_end ?? r.end_date ?? r.end_time
+  })).filter(r => r.id != null && r.datetime_start != null);
+}
+
+function isFutureSchedule(row) {
+  if (!row.datetime_start) return false;
+  const start = new Date(row.datetime_start);
+  if (Number.isNaN(start.getTime())) return true;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return start >= today;
+}
+
 async function queryTourSchedule(tourId) {
-  const queries = [
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE tour_id = $1 AND datetime_start >= CURRENT_DATE
-     ORDER BY datetime_start`,
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE tour = $1 AND datetime_start >= CURRENT_DATE
-     ORDER BY datetime_start`,
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE id_tour = $1 AND datetime_start >= CURRENT_DATE
-     ORDER BY datetime_start`,
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE tour_id = $1 AND datetime_start::date >= CURRENT_DATE
-     ORDER BY datetime_start`,
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE tour = $1 AND datetime_start::date >= CURRENT_DATE
-     ORDER BY datetime_start`
-  ];
-  let lastResult = [];
-  for (const sql of queries) {
+  const tableNames = ['tours_schedule', 'tour_schedule'];
+  const staticQueries = [];
+  for (const table of tableNames) {
+    staticQueries.push(
+      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour_id = $1 AND datetime_start >= CURRENT_DATE ORDER BY datetime_start`,
+      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour = $1 AND datetime_start >= CURRENT_DATE ORDER BY datetime_start`,
+      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE id_tour = $1 AND datetime_start >= CURRENT_DATE ORDER BY datetime_start`,
+      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour_id = $1 ORDER BY datetime_start`,
+      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour = $1 ORDER BY datetime_start`
+    );
+  }
+
+  for (const sql of staticQueries) {
     try {
-      lastResult = (await pool.query(sql, [tourId])).rows;
-      if (lastResult.length > 0) return lastResult;
+      const rows = normalizeScheduleRows((await pool.query(sql, [tourId])).rows).filter(isFutureSchedule);
+      if (rows.length > 0) return rows;
     } catch (e) {
       console.warn('Schedule query failed:', e.message);
     }
   }
-  return lastResult;
+
+  for (const table of tableNames) {
+    try {
+      const { rows: columns } = await pool.query(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1`,
+        [table]
+      );
+      const names = columns.map(c => c.column_name);
+      const tourCol = ['tour_id', 'tour', 'id_tour'].find(c => names.includes(c));
+      const startCol = ['datetime_start', 'date_start', 'start_date', 'start_time', 'datetime'].find(c => names.includes(c));
+      const endCol = ['datetime_end', 'date_end', 'end_date', 'end_time'].find(c => names.includes(c));
+      const idCol = ['id_tour_schedule', 'id_schedule', 'schedule_id', 'id'].find(c => names.includes(c));
+      if (!tourCol || !startCol || !idCol) continue;
+
+      const endSelect = endCol || startCol;
+      const sql = `SELECT ${idCol} AS id_tour_schedule, ${startCol} AS datetime_start, ${endSelect} AS datetime_end
+                   FROM ${table} WHERE ${tourCol} = $1 ORDER BY ${startCol}`;
+      const rows = normalizeScheduleRows((await pool.query(sql, [tourId])).rows).filter(isFutureSchedule);
+      if (rows.length > 0) return rows;
+    } catch (e) {
+      console.warn('Dynamic schedule query failed:', e.message);
+    }
+  }
+
+  for (const table of tableNames) {
+    try {
+      const allRows = (await pool.query(`SELECT * FROM ${table}`)).rows;
+      const matched = allRows.filter(row =>
+        Object.entries(row).some(([key, value]) =>
+          !key.includes('datetime') && !key.includes('date') && !key.includes('time')
+          && String(value) === String(tourId))
+      );
+      const rows = normalizeScheduleRows(matched).filter(isFutureSchedule);
+      if (rows.length > 0) return rows;
+    } catch (e) {
+      console.warn('Schedule scan failed:', e.message);
+    }
+  }
+
+  return [];
 }
 
-function normalizeScheduleRows(rows) {
-  return rows.map(r => ({
-    id: r.id_tour_schedule,
-    id_tour_schedule: r.id_tour_schedule,
-    datetime_start: r.datetime_start,
-    datetime_end: r.datetime_end
-  }));
+async function seedDefaultSchedules(tourId) {
+  const offsets = [7, 14, 21, 28];
+  const tableNames = ['tours_schedule', 'tour_schedule'];
+
+  for (const table of tableNames) {
+    try {
+      const { rows: columns } = await pool.query(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1`,
+        [table]
+      );
+      if (columns.length === 0) continue;
+
+      const names = columns.map(c => c.column_name);
+      const tourCol = ['tour_id', 'tour', 'id_tour'].find(c => names.includes(c));
+      const startCol = ['datetime_start', 'date_start', 'start_date', 'start_time', 'datetime'].find(c => names.includes(c));
+      const endCol = ['datetime_end', 'date_end', 'end_date', 'end_time'].find(c => names.includes(c));
+      const idCol = ['id_tour_schedule', 'id_schedule', 'schedule_id', 'id'].find(c => names.includes(c));
+      if (!tourCol || !startCol) continue;
+
+      const endColSql = endCol || startCol;
+      const created = [];
+
+      for (const days of offsets) {
+        const start = new Date();
+        start.setDate(start.getDate() + days);
+        start.setHours(10, 0, 0, 0);
+        const end = new Date(start);
+        end.setHours(18, 0, 0, 0);
+
+        const sql = `INSERT INTO ${table} (${tourCol}, ${startCol}, ${endColSql})
+                     VALUES ($1, $2, $3)
+                     RETURNING *`;
+        try {
+          const result = await pool.query(sql, [tourId, start, end]);
+          if (result.rows[0]) created.push(result.rows[0]);
+        } catch (e) {
+          console.warn('Schedule seed insert failed:', e.message);
+        }
+      }
+
+      if (created.length > 0) {
+        console.log(`Seeded ${created.length} schedules for tour ${tourId} in ${table}`);
+        return normalizeScheduleRows(created);
+      }
+    } catch (e) {
+      console.warn('Schedule seed failed:', e.message);
+    }
+  }
+
+  return [];
 }
 
 app.get('/api/main-data', async (req, res) => {
@@ -453,8 +544,11 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
 
 app.get('/api/tour-schedule/:tourId', async (req, res) => {
   try {
-    const rows = await queryTourSchedule(req.params.tourId);
-    res.json(normalizeScheduleRows(rows));
+    let rows = await queryTourSchedule(req.params.tourId);
+    if (rows.length === 0) {
+      rows = await seedDefaultSchedules(req.params.tourId);
+    }
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
