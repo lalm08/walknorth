@@ -43,13 +43,63 @@ const formatRows = async (rows, width = 300) => {
 };
 
 async function getRoutePoints(routeId) {
-  const pointsRes = await pool.query(`
-    SELECT ST_Y(p.location::geometry) as lat, ST_X(p.location::geometry) as lon, p.name_place
-    FROM places p
-    JOIN place_and_route par ON p.id_place = par.place_id
-    WHERE par.route_id = $1
-    ORDER BY par.order_number`, [routeId]);
-  return pointsRes.rows;
+  const queries = [
+    `SELECT ST_Y(p.location::geometry) AS lat, ST_X(p.location::geometry) AS lon, p.name_place
+     FROM places p
+     JOIN place_and_route par ON p.id_place = par.place_id
+     WHERE par.route_id = $1
+     ORDER BY par.order_number`,
+    `SELECT ST_Y(p.location::geometry) AS lat, ST_X(p.location::geometry) AS lon, p.name_place
+     FROM places p
+     JOIN place_and_route par ON p.id_place = par.place_id
+     WHERE par.route_id = $1
+     ORDER BY p.name_place`
+  ];
+  for (const sql of queries) {
+    try {
+      return (await pool.query(sql, [routeId])).rows;
+    } catch (e) {
+      console.warn('Route points query failed:', e.message);
+    }
+  }
+  return [];
+}
+
+async function getTourPlaces(tourId) {
+  const joinVariants = [
+    'JOIN route_and_tour rat ON t.id_tour = rat.tour_id',
+    'JOIN route_and_tour rat ON t.id_tour = rat.tour'
+  ];
+  for (const joinRat of joinVariants) {
+    const queries = [
+      `SELECT p.id_place, p.name_place, MIN(par.order_number) AS ord
+       FROM tours t
+       ${joinRat}
+       JOIN routes r ON rat.route_id = r.id_route
+       JOIN place_and_route par ON r.id_route = par.route_id
+       JOIN places p ON par.place_id = p.id_place
+       WHERE t.id_tour = $1
+       GROUP BY p.id_place, p.name_place
+       ORDER BY ord, p.name_place`,
+      `SELECT DISTINCT p.id_place, p.name_place
+       FROM tours t
+       ${joinRat}
+       JOIN routes r ON rat.route_id = r.id_route
+       JOIN place_and_route par ON r.id_route = par.route_id
+       JOIN places p ON par.place_id = p.id_place
+       WHERE t.id_tour = $1
+       ORDER BY p.name_place`
+    ];
+    for (const sql of queries) {
+      try {
+        const rows = (await pool.query(sql, [tourId])).rows;
+        if (rows.length > 0) return rows;
+      } catch (e) {
+        console.warn('Tour places query failed:', e.message);
+      }
+    }
+  }
+  return [];
 }
 
 async function getOrsPath(points, profile) {
@@ -100,7 +150,15 @@ async function queryTourSchedule(tourId) {
   const queries = [
     `SELECT id_tour_schedule, datetime_start, datetime_end
      FROM tours_schedule
-     WHERE tour = $1 AND datetime_start::date >= CURRENT_DATE
+     WHERE tour_id = $1 AND datetime_start >= CURRENT_DATE
+     ORDER BY datetime_start`,
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE tour = $1 AND datetime_start >= CURRENT_DATE
+     ORDER BY datetime_start`,
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE id_tour = $1 AND datetime_start >= CURRENT_DATE
      ORDER BY datetime_start`,
     `SELECT id_tour_schedule, datetime_start, datetime_end
      FROM tours_schedule
@@ -108,7 +166,7 @@ async function queryTourSchedule(tourId) {
      ORDER BY datetime_start`,
     `SELECT id_tour_schedule, datetime_start, datetime_end
      FROM tours_schedule
-     WHERE id_tour = $1 AND datetime_start::date >= CURRENT_DATE
+     WHERE tour = $1 AND datetime_start::date >= CURRENT_DATE
      ORDER BY datetime_start`
   ];
   let lastResult = [];
@@ -220,17 +278,12 @@ app.get('/api/tour-details/:id', async (req, res) => {
       return res.status(404).json({ error: 'Тур не найден' });
     }
 
-    const placesRes = await pool.query(
-      `SELECT DISTINCT p.id_place, p.name_place
-       FROM tours t
-       JOIN route_and_tour rat ON t.id_tour = rat.tour_id
-       JOIN routes r ON rat.route_id = r.id_route
-       JOIN place_and_route par ON r.id_route = par.route_id
-       JOIN places p ON par.place_id = p.id_place
-       WHERE t.id_tour = $1
-       ORDER BY par.order_number, p.name_place`,
-      [tourId]
-    );
+    let placesRows = [];
+    try {
+      placesRows = await getTourPlaces(tourId);
+    } catch (placesErr) {
+      console.warn('Tour places unavailable:', placesErr.message);
+    }
 
     let reviews = [];
     let avgRating = 0;
@@ -267,7 +320,7 @@ app.get('/api/tour-details/:id', async (req, res) => {
       name: tour.name_tour,
       description: tour.description,
       price: tour.price,
-      places: placesRes.rows.map(p => ({ id: p.id_place, name: p.name_place })),
+      places: placesRows.map(p => ({ id: p.id_place, name: p.name_place })),
       reviews,
       avgRating,
       isFavorite
@@ -316,16 +369,31 @@ app.get('/api/favorites/:userId', async (req, res) => {
 
 app.get('/api/tour-map/:tourId', async (req, res) => {
   const tourId = parseInt(req.params.tourId, 10);
+  const routeQueries = [
+    `SELECT r.id_route
+     FROM route_and_tour rat
+     JOIN routes r ON rat.route_id = r.id_route
+     WHERE rat.tour_id = $1
+     ORDER BY r.id_route`,
+    `SELECT r.id_route
+     FROM route_and_tour rat
+     JOIN routes r ON rat.route_id = r.id_route
+     WHERE rat.tour = $1
+     ORDER BY r.id_route`
+  ];
   try {
-    const routesRes = await pool.query(
-      `SELECT r.id_route
-       FROM route_and_tour rat
-       JOIN routes r ON rat.route_id = r.id_route
-       WHERE rat.tour_id = $1
-       ORDER BY r.id_route`,
-      [tourId]
-    );
-    const routeIds = routesRes.rows.map(r => r.id_route);
+    let routeIds = [];
+    for (const sql of routeQueries) {
+      try {
+        const routesRes = await pool.query(sql, [tourId]);
+        if (routesRes.rows.length > 0) {
+          routeIds = routesRes.rows.map(r => r.id_route);
+          break;
+        }
+      } catch (e) {
+        console.warn('Tour routes query failed:', e.message);
+      }
+    }
     const isRiverTour = tourId >= 5 && tourId <= 7;
     const segments = [];
 
