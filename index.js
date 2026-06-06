@@ -61,13 +61,19 @@ app.get('/api/main-data', async (req, res) => {
       LIMIT 5`;
       
     const nearbyPromise = pool.query(nearbySql, [`%${searchCity}%`]);
-    const [districtsRes, nearbyRes] = await Promise.all([districtsPromise, nearbyPromise]);
+    const pickedPromise = pool.query(
+      `SELECT id_tour, name_tour, price FROM tours ORDER BY RANDOM() LIMIT 5`
+    );
+    const [districtsRes, nearbyRes, pickedRes] = await Promise.all([
+      districtsPromise, nearbyPromise, pickedPromise
+    ]);
     const compressedDistricts = await formatRows(districtsRes.rows, 150);
     const compressedNearby = await formatRows(nearbyRes.rows, 350);
 
     res.json({
       districts: compressedDistricts,
-      nearby: compressedNearby
+      nearby: compressedNearby,
+      pickedTours: pickedRes.rows
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -212,6 +218,94 @@ app.get('/api/favorites/:userId', async (req, res) => {
        ORDER BY t.name_tour`,
       [req.params.userId]
     );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/tour-schedule/:tourId', async (req, res) => {
+  const tourId = req.params.tourId;
+  const sqlVariants = [
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE tour = $1 AND datetime_start >= CURRENT_DATE
+     ORDER BY datetime_start`,
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE tour_id = $1 AND datetime_start >= CURRENT_DATE
+     ORDER BY datetime_start`
+  ];
+  try {
+    let result;
+    try {
+      result = await pool.query(sqlVariants[0], [tourId]);
+    } catch (e) {
+      result = await pool.query(sqlVariants[1], [tourId]);
+    }
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/bookings', async (req, res) => {
+  const { userId, scheduleId, countPeople } = req.body;
+  if (!userId || userId === -1 || !scheduleId) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+  try {
+    const schedule = await pool.query(
+      `SELECT id_tour_schedule FROM tours_schedule
+       WHERE id_tour_schedule = $1 AND datetime_start >= CURRENT_DATE`,
+      [scheduleId]
+    );
+    if (schedule.rows.length === 0) {
+      return res.status(400).json({ error: 'Дата недоступна для бронирования' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO bookings (user_id, tour_schedule, status_booking, date_booking, count_people)
+       VALUES ($1, $2, 1, CURRENT_TIMESTAMP, $3)
+       RETURNING id_booking`,
+      [userId, scheduleId, countPeople || 1]
+    );
+    res.json({ success: true, bookingId: result.rows[0].id_booking });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/bookings/:userId', async (req, res) => {
+  const joinTour = [
+    `JOIN tours t ON ts.tour = t.id_tour`,
+    `JOIN tours t ON ts.tour_id = t.id_tour`
+  ];
+  try {
+    let result;
+    try {
+      result = await pool.query(
+        `SELECT b.id_booking, t.id_tour, t.name_tour, t.price,
+                ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking
+         FROM bookings b
+         JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+         ${joinTour[0]}
+         WHERE b.user_id = $1
+         ORDER BY ts.datetime_start DESC`,
+        [req.params.userId]
+      );
+    } catch (e) {
+      result = await pool.query(
+        `SELECT b.id_booking, t.id_tour, t.name_tour, t.price,
+                ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking
+         FROM bookings b
+         JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+         ${joinTour[1]}
+         WHERE b.user_id = $1
+         ORDER BY ts.datetime_start DESC`,
+        [req.params.userId]
+      );
+    }
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
