@@ -177,10 +177,17 @@ async function queryTourSchedule(tourId) {
     );
   }
 
+  const byId = new Map();
+
+  const addRows = (rows) => {
+    for (const row of normalizeScheduleRows(rows).filter(isFutureSchedule)) {
+      byId.set(String(row.id_tour_schedule), row);
+    }
+  };
+
   for (const sql of staticQueries) {
     try {
-      const rows = normalizeScheduleRows((await pool.query(sql, [tourId])).rows).filter(isFutureSchedule);
-      if (rows.length > 0) return rows;
+      addRows((await pool.query(sql, [tourId])).rows);
     } catch (e) {
       console.warn('Schedule query failed:', e.message);
     }
@@ -203,8 +210,7 @@ async function queryTourSchedule(tourId) {
       const endSelect = endCol || startCol;
       const sql = `SELECT ${idCol} AS id_tour_schedule, ${startCol} AS datetime_start, ${endSelect} AS datetime_end
                    FROM ${table} WHERE ${tourCol} = $1 ORDER BY ${startCol}`;
-      const rows = normalizeScheduleRows((await pool.query(sql, [tourId])).rows).filter(isFutureSchedule);
-      if (rows.length > 0) return rows;
+      addRows((await pool.query(sql, [tourId])).rows);
     } catch (e) {
       console.warn('Dynamic schedule query failed:', e.message);
     }
@@ -218,14 +224,15 @@ async function queryTourSchedule(tourId) {
           !key.includes('datetime') && !key.includes('date') && !key.includes('time')
           && String(value) === String(tourId))
       );
-      const rows = normalizeScheduleRows(matched).filter(isFutureSchedule);
-      if (rows.length > 0) return rows;
+      addRows(matched);
     } catch (e) {
       console.warn('Schedule scan failed:', e.message);
     }
   }
 
-  return [];
+  return Array.from(byId.values()).sort(
+    (a, b) => new Date(a.datetime_start) - new Date(b.datetime_start)
+  );
 }
 
 async function seedDefaultSchedules(tourId) {
