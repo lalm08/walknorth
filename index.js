@@ -155,84 +155,102 @@ function normalizeScheduleRows(rows) {
   })).filter(r => r.id != null && r.datetime_start != null);
 }
 
+let scheduleMetaCache = null;
+
+async function getScheduleTableMeta() {
+  if (scheduleMetaCache) return scheduleMetaCache;
+  const tableNames = ['tours_schedule', 'tour_schedule'];
+  for (const table of tableNames) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1`,
+        [table]
+      );
+      if (rows.length === 0) continue;
+      const names = rows.map(c => c.column_name);
+      const tourCol = ['tour', 'tour_id', 'id_tour', 'fk_tour', 'id_tours'].find(c => names.includes(c));
+      const startCol = ['datetime_start', 'date_start', 'start_date', 'start_time', 'datetime']
+        .find(c => names.includes(c));
+      const endCol = ['datetime_end', 'date_end', 'end_date', 'end_time'].find(c => names.includes(c));
+      const idCol = ['id_tour_schedule', 'id_schedule', 'schedule_id'].find(c => names.includes(c))
+        || (names.includes('id') ? 'id' : null);
+      if (tourCol && startCol && idCol) {
+        scheduleMetaCache = { table, tourCol, startCol, endCol, idCol };
+        return scheduleMetaCache;
+      }
+    } catch (e) {
+      console.warn('Schedule meta detection failed:', e.message);
+    }
+  }
+  return null;
+}
+
 function isFutureSchedule(row) {
   if (!row.datetime_start) return false;
   const start = new Date(row.datetime_start);
   if (Number.isNaN(start.getTime())) return true;
+  const startDay = new Date(start.getFullYear(), start.getMonth(), start.getDate());
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  return start >= today;
+  return startDay >= today;
 }
 
 async function queryTourSchedule(tourId) {
-  const tableNames = ['tours_schedule', 'tour_schedule'];
-  const staticQueries = [];
-  for (const table of tableNames) {
-    staticQueries.push(
-      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour_id = $1 AND datetime_start >= CURRENT_DATE ORDER BY datetime_start`,
-      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour = $1 AND datetime_start >= CURRENT_DATE ORDER BY datetime_start`,
-      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE id_tour = $1 AND datetime_start >= CURRENT_DATE ORDER BY datetime_start`,
-      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour_id = $1 ORDER BY datetime_start`,
-      `SELECT id_tour_schedule, datetime_start, datetime_end FROM ${table} WHERE tour = $1 ORDER BY datetime_start`
-    );
-  }
+  const tid = Number(tourId);
+  const meta = await getScheduleTableMeta();
+  if (!meta) return [];
+
+  const endSelect = meta.endCol || meta.startCol;
+  const selectSql = `${meta.idCol} AS id_tour_schedule, ${meta.startCol} AS datetime_start, ${endSelect} AS datetime_end`;
+
+  const queries = [
+    `SELECT ${selectSql} FROM ${meta.table} WHERE ${meta.tourCol} = $1 ORDER BY ${meta.startCol}`,
+    `SELECT ${selectSql} FROM ${meta.table} WHERE CAST(${meta.tourCol} AS TEXT) = $1 ORDER BY ${meta.startCol}`,
+    `SELECT ts.${meta.idCol} AS id_tour_schedule, ts.${meta.startCol} AS datetime_start, ts.${endSelect} AS datetime_end
+     FROM ${meta.table} ts
+     INNER JOIN tours t ON ts.${meta.tourCol} = t.id_tour
+     WHERE t.id_tour = $1
+     ORDER BY ts.${meta.startCol}`
+  ];
 
   const byId = new Map();
 
-  const addRows = (rows) => {
-    for (const row of normalizeScheduleRows(rows).filter(isFutureSchedule)) {
+  const addRows = (rows, onlyFuture) => {
+    for (const row of normalizeScheduleRows(rows)) {
+      if (onlyFuture && !isFutureSchedule(row)) continue;
       byId.set(String(row.id_tour_schedule), row);
     }
   };
 
-  for (const sql of staticQueries) {
+  for (const sql of queries) {
     try {
-      addRows((await pool.query(sql, [tourId])).rows);
+      addRows((await pool.query(sql, [tid])).rows, false);
     } catch (e) {
       console.warn('Schedule query failed:', e.message);
     }
   }
 
-  for (const table of tableNames) {
-    try {
-      const { rows: columns } = await pool.query(
-        `SELECT column_name FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = $1`,
-        [table]
-      );
-      const names = columns.map(c => c.column_name);
-      const tourCol = ['tour_id', 'tour', 'id_tour'].find(c => names.includes(c));
-      const startCol = ['datetime_start', 'date_start', 'start_date', 'start_time', 'datetime'].find(c => names.includes(c));
-      const endCol = ['datetime_end', 'date_end', 'end_date', 'end_time'].find(c => names.includes(c));
-      const idCol = ['id_tour_schedule', 'id_schedule', 'schedule_id', 'id'].find(c => names.includes(c));
-      if (!tourCol || !startCol || !idCol) continue;
-
-      const endSelect = endCol || startCol;
-      const sql = `SELECT ${idCol} AS id_tour_schedule, ${startCol} AS datetime_start, ${endSelect} AS datetime_end
-                   FROM ${table} WHERE ${tourCol} = $1 ORDER BY ${startCol}`;
-      addRows((await pool.query(sql, [tourId])).rows);
-    } catch (e) {
-      console.warn('Dynamic schedule query failed:', e.message);
-    }
+  try {
+    const allSql = `SELECT ${selectSql}
+                    FROM ${meta.table}
+                    WHERE (${meta.startCol})::date >= CURRENT_DATE
+                    ORDER BY ${meta.startCol}`;
+    addRows((await pool.query(allSql)).rows, false);
+  } catch (e) {
+    console.warn('Schedule all-rows query failed:', e.message);
   }
 
-  for (const table of tableNames) {
-    try {
-      const allRows = (await pool.query(`SELECT * FROM ${table}`)).rows;
-      const matched = allRows.filter(row =>
-        Object.entries(row).some(([key, value]) =>
-          !key.includes('datetime') && !key.includes('date') && !key.includes('time')
-          && String(value) === String(tourId))
-      );
-      addRows(matched);
-    } catch (e) {
-      console.warn('Schedule scan failed:', e.message);
-    }
-  }
-
-  return Array.from(byId.values()).sort(
+  let result = Array.from(byId.values()).sort(
     (a, b) => new Date(a.datetime_start) - new Date(b.datetime_start)
   );
+
+  const future = result.filter(isFutureSchedule);
+  if (future.length > 0) {
+    return future;
+  }
+
+  return result;
 }
 
 async function seedDefaultSchedules(tourId) {
