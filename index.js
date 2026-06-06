@@ -42,6 +42,96 @@ const formatRows = async (rows, width = 300) => {
   }));
 };
 
+async function getRoutePoints(routeId) {
+  const pointsRes = await pool.query(`
+    SELECT ST_Y(p.location::geometry) as lat, ST_X(p.location::geometry) as lon, p.name_place
+    FROM places p
+    JOIN place_and_route par ON p.id_place = par.place_id
+    WHERE par.route_id = $1
+    ORDER BY par.order_number`, [routeId]);
+  return pointsRes.rows;
+}
+
+async function getOrsPath(points, profile) {
+  if (!points || points.length === 0) return [];
+  if (points.length === 1) {
+    return [{ lat: parseFloat(points[0].lat), lon: parseFloat(points[0].lon) }];
+  }
+  const coords = points.map(p => [parseFloat(p.lon), parseFloat(p.lat)]);
+  try {
+    const orsResponse = await axios.post(
+      `https://api.openrouteservice.org/v2/directions/${profile}/geojson`,
+      { coordinates: coords, language: 'ru', preference: 'shortest' },
+      {
+        headers: {
+          Authorization: process.env.ORS_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    return orsResponse.data.features[0].geometry.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
+  } catch (e) {
+    return points.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+  }
+}
+
+async function getRoutePathFromDb(routeId) {
+  try {
+    const res = await pool.query(
+      `SELECT ST_AsGeoJSON(r.route_path) AS geojson FROM routes r WHERE r.id_route = $1`,
+      [routeId]
+    );
+    if (res.rows[0]?.geojson) {
+      const geo = JSON.parse(res.rows[0].geojson);
+      if (geo.type === 'LineString') {
+        return geo.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
+      }
+      if (geo.type === 'MultiLineString') {
+        return geo.coordinates.flat().map(c => ({ lat: c[1], lon: c[0] }));
+      }
+    }
+  } catch (e) {
+    console.warn('Route path unavailable:', e.message);
+  }
+  return [];
+}
+
+async function queryTourSchedule(tourId) {
+  const queries = [
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE tour = $1 AND datetime_start::date >= CURRENT_DATE
+     ORDER BY datetime_start`,
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE tour_id = $1 AND datetime_start::date >= CURRENT_DATE
+     ORDER BY datetime_start`,
+    `SELECT id_tour_schedule, datetime_start, datetime_end
+     FROM tours_schedule
+     WHERE id_tour = $1 AND datetime_start::date >= CURRENT_DATE
+     ORDER BY datetime_start`
+  ];
+  let lastResult = [];
+  for (const sql of queries) {
+    try {
+      lastResult = (await pool.query(sql, [tourId])).rows;
+      if (lastResult.length > 0) return lastResult;
+    } catch (e) {
+      console.warn('Schedule query failed:', e.message);
+    }
+  }
+  return lastResult;
+}
+
+function normalizeScheduleRows(rows) {
+  return rows.map(r => ({
+    id: r.id_tour_schedule,
+    id_tour_schedule: r.id_tour_schedule,
+    datetime_start: r.datetime_start,
+    datetime_end: r.datetime_end
+  }));
+}
+
 app.get('/api/main-data', async (req, res) => {
   const { cityName } = req.query;
   const searchCity = cityName || 'Сыктывкар'; 
@@ -138,7 +228,7 @@ app.get('/api/tour-details/:id', async (req, res) => {
        JOIN place_and_route par ON r.id_route = par.route_id
        JOIN places p ON par.place_id = p.id_place
        WHERE t.id_tour = $1
-       ORDER BY p.name_place`,
+       ORDER BY par.order_number, p.name_place`,
       [tourId]
     );
 
@@ -224,26 +314,79 @@ app.get('/api/favorites/:userId', async (req, res) => {
   }
 });
 
-app.get('/api/tour-schedule/:tourId', async (req, res) => {
-  const tourId = req.params.tourId;
-  const sqlVariants = [
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE tour = $1 AND datetime_start >= CURRENT_DATE
-     ORDER BY datetime_start`,
-    `SELECT id_tour_schedule, datetime_start, datetime_end
-     FROM tours_schedule
-     WHERE tour_id = $1 AND datetime_start >= CURRENT_DATE
-     ORDER BY datetime_start`
-  ];
+app.get('/api/tour-map/:tourId', async (req, res) => {
+  const tourId = parseInt(req.params.tourId, 10);
   try {
-    let result;
-    try {
-      result = await pool.query(sqlVariants[0], [tourId]);
-    } catch (e) {
-      result = await pool.query(sqlVariants[1], [tourId]);
+    const routesRes = await pool.query(
+      `SELECT r.id_route
+       FROM route_and_tour rat
+       JOIN routes r ON rat.route_id = r.id_route
+       WHERE rat.tour_id = $1
+       ORDER BY r.id_route`,
+      [tourId]
+    );
+    const routeIds = routesRes.rows.map(r => r.id_route);
+    const isRiverTour = tourId >= 5 && tourId <= 7;
+    const segments = [];
+
+    if (isRiverTour) {
+      if (routeIds.length >= 2) {
+        const carPoints = await getRoutePoints(routeIds[0]);
+        const boatPoints = await getRoutePoints(routeIds[1]);
+        let boatPath = await getRoutePathFromDb(routeIds[1]);
+        if (boatPath.length === 0) {
+          boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+        }
+        segments.push({
+          type: 'car',
+          label: 'Дорога на машине',
+          points: carPoints,
+          path: await getOrsPath(carPoints, 'driving-car')
+        });
+        segments.push({
+          type: 'boat',
+          label: 'Сплав на лодке',
+          points: boatPoints,
+          path: boatPath
+        });
+      } else if (routeIds.length === 1) {
+        const points = await getRoutePoints(routeIds[0]);
+        const splitIndex = Math.max(1, Math.ceil(points.length / 2));
+        const carPoints = points.slice(0, splitIndex);
+        const boatPoints = points.slice(splitIndex - 1);
+        segments.push({
+          type: 'car',
+          label: 'Дорога на машине',
+          points: carPoints,
+          path: await getOrsPath(carPoints, 'driving-car')
+        });
+        segments.push({
+          type: 'boat',
+          label: 'Сплав на лодке',
+          points: boatPoints,
+          path: boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }))
+        });
+      }
+    } else if (routeIds.length > 0) {
+      const points = await getRoutePoints(routeIds[0]);
+      segments.push({
+        type: 'car',
+        label: 'Маршрут на машине',
+        points,
+        path: await getOrsPath(points, 'driving-car')
+      });
     }
-    res.json(result.rows);
+
+    res.json({ isRiverTour, segments });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/tour-schedule/:tourId', async (req, res) => {
+  try {
+    const rows = await queryTourSchedule(req.params.tourId);
+    res.json(normalizeScheduleRows(rows));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -257,56 +400,74 @@ app.post('/api/bookings', async (req, res) => {
   try {
     const schedule = await pool.query(
       `SELECT id_tour_schedule FROM tours_schedule
-       WHERE id_tour_schedule = $1 AND datetime_start >= CURRENT_DATE`,
+       WHERE id_tour_schedule = $1 AND datetime_start::date >= CURRENT_DATE`,
       [scheduleId]
     );
     if (schedule.rows.length === 0) {
       return res.status(400).json({ error: 'Дата недоступна для бронирования' });
     }
 
-    const result = await pool.query(
+    const insertQueries = [
       `INSERT INTO bookings (user_id, tour_schedule, status_booking, date_booking, count_people)
-       VALUES ($1, $2, 1, CURRENT_TIMESTAMP, $3)
-       RETURNING id_booking`,
-      [userId, scheduleId, countPeople || 1]
-    );
-    res.json({ success: true, bookingId: result.rows[0].id_booking });
+       VALUES ($1, $2, 1, CURRENT_TIMESTAMP, $3) RETURNING id_booking`,
+      `INSERT INTO bookings (user_id, tour_schedule_id, status_booking, date_booking, count_people)
+       VALUES ($1, $2, 1, CURRENT_TIMESTAMP, $3) RETURNING id_booking`
+    ];
+
+    let bookingId = null;
+    for (const sql of insertQueries) {
+      try {
+        const result = await pool.query(sql, [userId, scheduleId, countPeople || 1]);
+        bookingId = result.rows[0].id_booking;
+        break;
+      } catch (e) {
+        console.warn('Booking insert failed:', e.message);
+      }
+    }
+
+    if (!bookingId) {
+      return res.status(500).json({ error: 'Не удалось создать бронирование' });
+    }
+    res.json({ success: true, bookingId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get('/api/bookings/:userId', async (req, res) => {
-  const joinTour = [
-    `JOIN tours t ON ts.tour = t.id_tour`,
-    `JOIN tours t ON ts.tour_id = t.id_tour`
+  const variants = [
+    {
+      join: 'JOIN tours t ON ts.tour = t.id_tour',
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule'
+    },
+    {
+      join: 'JOIN tours t ON ts.tour_id = t.id_tour',
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule'
+    },
+    {
+      join: 'JOIN tours t ON ts.tour_id = t.id_tour',
+      scheduleCol: 'b.tour_schedule_id = ts.id_tour_schedule'
+    }
   ];
   try {
-    let result;
-    try {
-      result = await pool.query(
-        `SELECT b.id_booking, t.id_tour, t.name_tour, t.price,
-                ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking
-         FROM bookings b
-         JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
-         ${joinTour[0]}
-         WHERE b.user_id = $1
-         ORDER BY ts.datetime_start DESC`,
-        [req.params.userId]
-      );
-    } catch (e) {
-      result = await pool.query(
-        `SELECT b.id_booking, t.id_tour, t.name_tour, t.price,
-                ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking
-         FROM bookings b
-         JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
-         ${joinTour[1]}
-         WHERE b.user_id = $1
-         ORDER BY ts.datetime_start DESC`,
-        [req.params.userId]
-      );
+    for (const variant of variants) {
+      try {
+        const result = await pool.query(
+          `SELECT b.id_booking, t.id_tour, t.name_tour, t.price,
+                  ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking
+           FROM bookings b
+           JOIN tours_schedule ts ON ${variant.scheduleCol}
+           ${variant.join}
+           WHERE b.user_id = $1
+           ORDER BY ts.datetime_start DESC`,
+          [req.params.userId]
+        );
+        return res.json(result.rows);
+      } catch (e) {
+        console.warn('Bookings query failed:', e.message);
+      }
     }
-    res.json(result.rows);
+    res.json([]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
