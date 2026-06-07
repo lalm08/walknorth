@@ -722,9 +722,9 @@ app.post('/api/bookings', async (req, res) => {
           const tourInfo = await pool.query(sql, [scheduleId]);
           if (tourInfo.rows.length > 0) {
             const { id_tour, name_tour } = tourInfo.rows[0];
-            const guide_id = await resolveGuideIdForTour(id_tour);
-            if (guide_id) {
-              await ensureTourChat(userId, guide_id, name_tour);
+            const guideUserId = await resolveGuideUserIdForTour(id_tour);
+            if (guideUserId) {
+              await ensureTourChat(userId, guideUserId, name_tour);
             }
             break;
           }
@@ -1127,20 +1127,41 @@ function statusApiToDbCandidates(statusApi) {
   return map[statusApi] || map.active;
 }
 
-async function queryGuideTours(guideId, archived) {
+async function queryGuideTours(guideUserId, archived) {
   const meta = await getToursTableMeta();
   const statusSelect = meta.statusCol ? `, t.${meta.statusCol} AS tour_status` : ", 'active' AS tour_status";
   const durationSelect = meta.durationCol ? `, t.${meta.durationCol} AS duration` : ", NULL AS duration";
+  const selectSql = `SELECT t.id_tour, t.name_tour, t.price${statusSelect}${durationSelect} FROM tours t`;
 
-  let sql = `SELECT t.id_tour, t.name_tour, t.price${statusSelect}${durationSelect} FROM tours t`;
-  const params = [];
+  let rows = [];
   if (meta.guideCol) {
-    sql += ` WHERE t.${meta.guideCol} = $1`;
-    params.push(guideId);
+    rows = (await pool.query(
+      `${selectSql} WHERE t.${meta.guideCol} = $1 ORDER BY t.name_tour`,
+      [guideUserId]
+    )).rows;
+  } else {
+    const variants = [
+      `${selectSql}
+       JOIN guides_and_tours gt ON gt.tour_id = t.id_tour
+       JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
+       WHERE gp.user_id = $1
+       ORDER BY t.name_tour`,
+      `${selectSql}
+       JOIN guides_and_tours gt ON gt.tour_id = t.id_tour
+       JOIN users u ON u.id_user = gt.guide_id AND u.role_id = 2
+       WHERE u.id_user = $1
+       ORDER BY t.name_tour`
+    ];
+    for (const sql of variants) {
+      try {
+        rows = (await pool.query(sql, [guideUserId])).rows;
+        break;
+      } catch (e) {
+        console.warn('Guide tours query failed:', e.message);
+      }
+    }
   }
-  sql += ' ORDER BY t.name_tour';
 
-  const rows = (await pool.query(sql, params)).rows;
   return rows
     .map(row => ({
       id_tour: row.id_tour,
@@ -1264,11 +1285,15 @@ app.get('/api/guide/:userId/bookings', async (req, res) => {
         const params = [];
         if (meta.guideCol) {
           sql += ` WHERE t.${meta.guideCol} = $1`;
-          params.push(guideId);
+        } else {
+          sql += ` JOIN guides_and_tours gt ON gt.tour_id = t.id_tour
+                   JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
+                   WHERE gp.user_id = $1`;
         }
+        params.push(guideId);
         sql += ' ORDER BY ts.datetime_start DESC';
         rows = (await pool.query(sql, params)).rows;
-        if (rows.length > 0 || meta.guideCol) break;
+        break;
       } catch (e) {
         console.warn('Guide bookings query failed:', e.message);
       }
@@ -1368,46 +1393,43 @@ async function getOrCreateTourTheme(tourName) {
   }
 }
 
-async function getGuideIdForTour(tourId) {
-  try {
-    const { rows } = await pool.query(
-      'SELECT guide_id FROM guides_and_tours WHERE tour_id = $1 ORDER BY id_guide_tour LIMIT 1',
-      [tourId]
-    );
-    return rows.length > 0 ? rows[0].guide_id : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-async function resolveGuideIdForTour(tourId) {
+async function resolveGuideUserIdForTour(tourId) {
   if (!tourId) return null;
-  let guideId = await getGuideIdForTour(tourId);
-  if (guideId) return guideId;
+
+  const profileQueries = [
+    `SELECT gp.user_id
+     FROM guides_and_tours gt
+     JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
+     WHERE gt.tour_id = $1
+     ORDER BY gt.id_guide_tour LIMIT 1`,
+    `SELECT u.id_user
+     FROM guides_and_tours gt
+     JOIN users u ON u.id_user = gt.guide_id AND u.role_id = 2
+     WHERE gt.tour_id = $1
+     ORDER BY gt.id_guide_tour LIMIT 1`
+  ];
+  for (const sql of profileQueries) {
+    try {
+      const { rows } = await pool.query(sql, [tourId]);
+      if (rows.length > 0 && rows[0].user_id) return rows[0].user_id;
+    } catch (e) {
+      console.warn('Guide resolve via guides_and_tours failed:', e.message);
+    }
+  }
+
   try {
     const meta = await getToursTableMeta();
     if (meta.guideCol) {
       const { rows } = await pool.query(
-        `SELECT ${meta.guideCol} AS guide_id FROM tours WHERE id_tour = $1`,
+        `SELECT ${meta.guideCol} AS user_id FROM tours WHERE id_tour = $1`,
         [tourId]
       );
-      if (rows.length > 0 && rows[0].guide_id) return rows[0].guide_id;
+      if (rows.length > 0 && rows[0].user_id) return rows[0].user_id;
     }
   } catch (e) {
     console.warn('Guide resolve via tours failed:', e.message);
   }
-  try {
-    const { rows } = await pool.query(
-      `SELECT u.id_user FROM users u
-       JOIN guides_and_tours gt ON gt.guide_id = u.id_user
-       WHERE gt.tour_id = $1 AND u.role_id = 2
-       ORDER BY u.id_user LIMIT 1`,
-      [tourId]
-    );
-    if (rows.length > 0) return rows[0].id_user;
-  } catch (e) {
-    console.warn('Guide resolve via users failed:', e.message);
-  }
+
   return null;
 }
 
@@ -1469,11 +1491,12 @@ async function syncTourChats(userId, roleId) {
         const meta = await getToursTableMeta();
         if (meta.guideCol) {
           sql += ` WHERE t.${meta.guideCol} = $1`;
-          params.push(userId);
         } else {
-          sql += ` JOIN guides_and_tours gt ON t.id_tour = gt.tour_id WHERE gt.guide_id = $1`;
-          params.push(userId);
+          sql += ` JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+                   JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
+                   WHERE gp.user_id = $1`;
         }
+        params.push(userId);
       } else {
         sql += ` WHERE b.user_id = $1`;
         params.push(userId);
@@ -1481,9 +1504,9 @@ async function syncTourChats(userId, roleId) {
 
       const { rows } = await pool.query(sql, params);
       for (const row of rows) {
-        const guideId = await resolveGuideIdForTour(row.id_tour);
-        if (guideId) {
-          await ensureTourChat(row.client_id, guideId, row.name_tour);
+        const guideUserId = await resolveGuideUserIdForTour(row.id_tour);
+        if (guideUserId) {
+          await ensureTourChat(row.client_id, guideUserId, row.name_tour);
         }
       }
       return;
@@ -1571,28 +1594,33 @@ app.get('/api/guide/:userId/reviews', async (req, res) => {
      FROM reviews r
      JOIN bookings b ON r.booking_id = b.id_booking
      JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
-     JOIN guides_and_tours gt ON ts.tour_id = gt.tour_id
+     JOIN tours t ON ts.tour = t.id_tour
+     JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+     JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
      JOIN users u ON b.user_id = u.id_user
-     WHERE gt.guide_id = $1
+     WHERE gp.user_id = $1
      ORDER BY r.id_review DESC`,
     `SELECT r.id_review, COALESCE(b.date_booking, r.id_review::text) AS review_date,
             u.fio AS client_name, r.rating, r.text_review AS text
      FROM reviews r
      JOIN bookings b ON r.booking_id = b.id_booking
      JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
-     JOIN guides_and_tours gt ON ts.tour_id = gt.tour_id
+     JOIN tours t ON ts.tour = t.id_tour
+     JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+     JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
      JOIN users u ON b.user_id = u.id_user
-     WHERE gt.guide_id = $1
+     WHERE gp.user_id = $1
      ORDER BY r.id_review DESC`,
     `SELECT r.id_review, COALESCE(b.date_booking, r.id_review::text) AS review_date,
             u.fio AS client_name, r.rating, COALESCE(r.comment, r.text_review) AS text
      FROM reviews r
      JOIN bookings b ON r.booking_id = b.id_booking
      JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
-     JOIN tours t ON ts.tour = t.id_tour
+     JOIN tours t ON ts.tour_id = t.id_tour
      JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+     JOIN guide_profiles gp ON gp.id_guide = gt.guide_id
      JOIN users u ON b.user_id = u.id_user
-     WHERE gt.guide_id = $1
+     WHERE gp.user_id = $1
      ORDER BY r.id_review DESC`
   ];
   try {
