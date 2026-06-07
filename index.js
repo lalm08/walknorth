@@ -231,16 +231,6 @@ async function queryTourSchedule(tourId) {
     }
   }
 
-  try {
-    const allSql = `SELECT ${selectSql}
-                    FROM ${meta.table}
-                    WHERE (${meta.startCol})::date >= CURRENT_DATE
-                    ORDER BY ${meta.startCol}`;
-    addRows((await pool.query(allSql)).rows, false);
-  } catch (e) {
-    console.warn('Schedule all-rows query failed:', e.message);
-  }
-
   let result = Array.from(byId.values()).sort(
     (a, b) => new Date(a.datetime_start) - new Date(b.datetime_start)
   );
@@ -590,12 +580,100 @@ app.get('/api/tour-schedule/:tourId', async (req, res) => {
   }
 });
 
+function normalizeScheduleKey(datetimeStart) {
+  if (!datetimeStart) return '';
+  const d = new Date(datetimeStart);
+  if (Number.isNaN(d.getTime())) return String(datetimeStart).substring(0, 16);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatPriceValue(price) {
+  if (price == null) return '0 ₽';
+  const num = Number(String(price).replace(',', '.'));
+  if (Number.isNaN(num)) return String(price);
+  if (Number.isInteger(num)) return `${num} ₽`;
+  return `${num.toFixed(2).replace(/\.?0+$/, '')} ₽`;
+}
+
+function groupClientBookings(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    const key = `${row.name_tour}|${normalizeScheduleKey(row.datetime_start)}`;
+    if (map.has(key)) {
+      const existing = map.get(key);
+      existing.count_people = (existing.count_people || 1) + (row.count_people || 1);
+    } else {
+      map.set(key, {
+        id_booking: row.id_booking,
+        id_tour: row.id_tour,
+        name_tour: row.name_tour,
+        price: formatPriceValue(row.price),
+        datetime_start: row.datetime_start,
+        datetime_end: row.datetime_end,
+        count_people: row.count_people || 1
+      });
+    }
+  }
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.datetime_start) - new Date(a.datetime_start)
+  );
+}
+
+function groupGuideBookings(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    const key = `${row.name_tour}|${normalizeScheduleKey(row.datetime_start)}`;
+    if (map.has(key)) {
+      const existing = map.get(key);
+      existing.count_people = (existing.count_people || 1) + (row.count_people || 1);
+    } else {
+      map.set(key, {
+        id_booking: row.id_booking,
+        id_tour: row.id_tour,
+        name_tour: row.name_tour,
+        datetime_start: row.datetime_start,
+        count_people: row.count_people || 1,
+        client_name: row.client_name || 'Клиент'
+      });
+    }
+  }
+  return Array.from(map.values()).sort(
+    (a, b) => new Date(b.datetime_start) - new Date(a.datetime_start)
+  );
+}
+
+async function scheduleBelongsToTour(scheduleId, tourId) {
+  if (!tourId) return true;
+  const meta = await getScheduleTableMeta();
+  if (!meta) return true;
+  const endSelect = meta.endCol || meta.startCol;
+  const selectSql = `${meta.idCol} AS id_tour_schedule, ${meta.tourCol} AS tour_ref`;
+  const queries = [
+    `SELECT ${selectSql} FROM ${meta.table} WHERE ${meta.idCol} = $1 AND ${meta.tourCol} = $2`,
+    `SELECT ${selectSql} FROM ${meta.table} WHERE ${meta.idCol} = $1 AND CAST(${meta.tourCol} AS TEXT) = $2`
+  ];
+  for (const sql of queries) {
+    try {
+      const { rows } = await pool.query(sql, [scheduleId, tourId]);
+      if (rows.length > 0) return true;
+    } catch (e) {
+      console.warn('Schedule tour check failed:', e.message);
+    }
+  }
+  return false;
+}
+
 app.post('/api/bookings', async (req, res) => {
-  const { userId, scheduleId, countPeople } = req.body;
+  const { userId, scheduleId, countPeople, tourId } = req.body;
   if (!userId || userId === -1 || !scheduleId) {
     return res.status(401).json({ error: 'Требуется авторизация' });
   }
   try {
+    if (tourId && !(await scheduleBelongsToTour(scheduleId, tourId))) {
+      return res.status(400).json({ error: 'Выбранная дата не относится к этому туру' });
+    }
+
     const schedule = await pool.query(
       `SELECT id_tour_schedule FROM tours_schedule
        WHERE id_tour_schedule = $1 AND datetime_start::date >= CURRENT_DATE`,
@@ -690,7 +768,7 @@ app.get('/api/bookings/:userId', async (req, res) => {
            ORDER BY ts.datetime_start DESC`,
           [req.params.userId]
         );
-        return res.json(result.rows);
+        return res.json(groupClientBookings(result.rows));
       } catch (e) {
         console.warn('Bookings query failed:', e.message);
       }
@@ -1140,14 +1218,14 @@ app.get('/api/guide/:userId/bookings', async (req, res) => {
         console.warn('Guide bookings query failed:', e.message);
       }
     }
-    res.json(rows.map(r => ({
+    res.json(groupGuideBookings(rows.map(r => ({
       id_booking: r.id_booking,
       id_tour: r.id_tour,
       name_tour: r.name_tour,
       datetime_start: r.datetime_start,
       count_people: r.count_people || 1,
       client_name: r.client_name || 'Клиент'
-    })));
+    }))));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
