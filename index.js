@@ -554,11 +554,15 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
       }
     } else if (routeIds.length > 0) {
       const points = await getRoutePoints(routeIds[0]);
+      let path = await getRoutePathFromDb(routeIds[0]);
+      if (path.length === 0) {
+        path = await getOrsPath(points, 'driving-car');
+      }
       segments.push({
         type: 'car',
         label: 'Маршрут на машине',
         points,
-        path: await getOrsPath(points, 'driving-car')
+        path
       });
     }
 
@@ -1098,12 +1102,39 @@ async function getToursTableMeta() {
     toursMetaCache = {
       guideCol: ['guide_id', 'user_id', 'id_guide', 'guide', 'id_user'].find(c => names.includes(c)),
       statusCol: ['status_tour', 'status', 'tour_status', 'state'].find(c => names.includes(c)),
-      durationCol: ['duration', 'duration_tour', 'time_tour', 'length'].find(c => names.includes(c))
+      durationCol: ['tour_time', 'duration', 'duration_tour', 'time_tour', 'length'].find(c => names.includes(c))
     };
   } catch (e) {
     toursMetaCache = { guideCol: null, statusCol: null, durationCol: null };
   }
   return toursMetaCache;
+}
+
+function formatTourDuration(value) {
+  if (value == null || value === '') return null;
+  const raw = String(value).trim();
+  if (!raw || raw === 'null') return null;
+
+  const clock = raw.match(/^(\d+):(\d{2}):(\d{2})(?:\.\d+)?$/);
+  if (clock) {
+    const totalHours = parseInt(clock[1], 10);
+    const minutes = parseInt(clock[2], 10);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    const parts = [];
+    if (days > 0) parts.push(`${days} дн.`);
+    if (hours > 0) parts.push(`${hours} ч.`);
+    if (minutes > 0 && days === 0) parts.push(`${minutes} мин.`);
+    return parts.length > 0 ? parts.join(' ') : '—';
+  }
+
+  const dayMatch = raw.match(/(\d+)\s*day/i);
+  if (dayMatch) {
+    const days = parseInt(dayMatch[1], 10);
+    return days > 0 ? `${days} дн.` : raw;
+  }
+
+  return raw;
 }
 
 function normalizeTourStatus(value) {
@@ -1130,7 +1161,9 @@ function statusApiToDbCandidates(statusApi) {
 async function queryGuideTours(guideUserId, archived) {
   const meta = await getToursTableMeta();
   const statusSelect = meta.statusCol ? `, t.${meta.statusCol} AS tour_status` : ", 'active' AS tour_status";
-  const durationSelect = meta.durationCol ? `, t.${meta.durationCol} AS duration` : ", NULL AS duration";
+  const durationSelect = meta.durationCol
+    ? `, t.${meta.durationCol}::text AS duration`
+    : ", NULL AS duration";
   const selectSql = `SELECT t.id_tour, t.name_tour, t.price${statusSelect}${durationSelect} FROM tours t`;
 
   let rows = [];
@@ -1167,7 +1200,7 @@ async function queryGuideTours(guideUserId, archived) {
       id_tour: row.id_tour,
       name_tour: row.name_tour,
       price: row.price,
-      duration: row.duration,
+      duration: formatTourDuration(row.duration),
       status: normalizeTourStatus(row.tour_status)
     }))
     .filter(row => archived ? isArchiveStatus(row.status) : !isArchiveStatus(row.status));
@@ -1187,7 +1220,9 @@ app.get('/api/guide/tours/:tourId', async (req, res) => {
   try {
     const meta = await getToursTableMeta();
     const statusSelect = meta.statusCol ? `, ${meta.statusCol} AS tour_status` : ", 'active' AS tour_status";
-    const durationSelect = meta.durationCol ? `, ${meta.durationCol} AS duration` : ", NULL AS duration";
+    const durationSelect = meta.durationCol
+      ? `, ${meta.durationCol}::text AS duration`
+      : ", NULL AS duration";
     const tourRes = await pool.query(
       `SELECT id_tour, name_tour, description, price${statusSelect}${durationSelect}
        FROM tours WHERE id_tour = $1`,
@@ -1208,7 +1243,7 @@ app.get('/api/guide/tours/:tourId', async (req, res) => {
       name: tour.name_tour,
       description: tour.description || '',
       price: tour.price,
-      duration: tour.duration,
+      duration: formatTourDuration(tour.duration),
       status: normalizeTourStatus(tour.tour_status),
       places: places.map(p => ({ id: p.id_place, name: p.name_place || p.name }))
     });
@@ -1573,7 +1608,7 @@ async function queryUserChats(userId, supportOnly, roleId) {
 
       filtered.push({
         id_chat: row.id_chat,
-        topic: supportOnly ? 'Поддержка' : String(row.topic || 'Чат').replace(/^Тур:\s*/, ''),
+        topic: supportOnly ? '' : String(row.topic || 'Чат').replace(/^Тур:\s*/, ''),
         partner_name: partnerName,
         date_chat: row.date_chat,
         is_support: isSupport
