@@ -626,6 +626,36 @@ app.post('/api/bookings', async (req, res) => {
     if (!bookingId) {
       return res.status(500).json({ error: 'Не удалось создать бронирование' });
     }
+
+    try {
+      const tourInfoVariants = [
+        `SELECT t.name_tour, gt.guide_id
+         FROM tours_schedule ts
+         JOIN tours t ON ts.tour = t.id_tour
+         JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+         WHERE ts.id_tour_schedule = $1`,
+        `SELECT t.name_tour, gt.guide_id
+         FROM tours_schedule ts
+         JOIN tours t ON ts.tour_id = t.id_tour
+         JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+         WHERE ts.id_tour_schedule = $1`
+      ];
+      for (const sql of tourInfoVariants) {
+        try {
+          const tourInfo = await pool.query(sql, [scheduleId]);
+          if (tourInfo.rows.length > 0) {
+            const { name_tour, guide_id } = tourInfo.rows[0];
+            await ensureTourChat(userId, guide_id, name_tour);
+            break;
+          }
+        } catch (e) {
+          console.warn('Tour chat after booking failed:', e.message);
+        }
+      }
+    } catch (e) {
+      console.warn('Tour chat sync after booking failed:', e.message);
+    }
+
     res.json({ success: true, bookingId });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1143,40 +1173,161 @@ async function findAdminUserId() {
   return null;
 }
 
-async function findSupportThemeId() {
-  const queries = [
-    `SELECT id_theme FROM themes
-     WHERE LOWER(name_theme) LIKE '%поддерж%' OR LOWER(name_theme) LIKE '%support%'
-     ORDER BY id_theme LIMIT 1`,
-    'SELECT id_theme FROM themes ORDER BY id_theme LIMIT 1'
-  ];
-  for (const sql of queries) {
-    try {
-      const { rows } = await pool.query(sql);
-      if (rows.length > 0) return rows[0].id_theme;
-    } catch (e) {
-      console.warn('Support theme lookup failed:', e.message);
-    }
-  }
+async function findSupportMetaThemeId() {
   try {
+    const exact = await pool.query(
+      `SELECT id_theme FROM themes
+       WHERE LOWER(TRIM(name_theme)) = 'поддержка' OR LOWER(TRIM(name_theme)) = 'support'
+       ORDER BY id_theme LIMIT 1`
+    );
+    if (exact.rows.length > 0) return exact.rows[0].id_theme;
     const created = await pool.query(
       `INSERT INTO themes (name_theme) VALUES ('Поддержка') RETURNING id_theme`
     );
     return created.rows[0].id_theme;
   } catch (e) {
-    console.warn('Support theme create failed:', e.message);
+    console.warn('Support meta theme failed:', e.message);
     return null;
   }
 }
 
-async function isSupportTheme(themeId) {
+function supportTopicRange(roleId) {
+  const role = Number(roleId);
+  if (role === 2) return { min: 4, max: 13 };
+  return { min: 1, max: 8 };
+}
+
+async function isSupportMetaChat(themeId) {
+  try {
+    const metaId = await findSupportMetaThemeId();
+    return metaId != null && Number(themeId) === Number(metaId);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function isTourChatTheme(themeId) {
   try {
     const { rows } = await pool.query('SELECT name_theme FROM themes WHERE id_theme = $1', [themeId]);
     if (rows.length === 0) return false;
-    const name = String(rows[0].name_theme || '').toLowerCase();
-    return name.includes('поддерж') || name.includes('support') || name.includes('админ');
+    return String(rows[0].name_theme || '').startsWith('Тур:');
   } catch (e) {
     return false;
+  }
+}
+
+async function getOrCreateTourTheme(tourName) {
+  const themeName = `Тур: ${tourName}`;
+  try {
+    const existing = await pool.query(
+      'SELECT id_theme FROM themes WHERE name_theme = $1 LIMIT 1',
+      [themeName]
+    );
+    if (existing.rows.length > 0) return existing.rows[0].id_theme;
+    const created = await pool.query(
+      'INSERT INTO themes (name_theme) VALUES ($1) RETURNING id_theme',
+      [themeName]
+    );
+    return created.rows[0].id_theme;
+  } catch (e) {
+    console.warn('Tour theme create failed:', e.message);
+    return null;
+  }
+}
+
+async function getGuideIdForTour(tourId) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT guide_id FROM guides_and_tours WHERE tour_id = $1 ORDER BY id_guide_tour LIMIT 1',
+      [tourId]
+    );
+    return rows.length > 0 ? rows[0].guide_id : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function ensureTourChat(clientId, guideId, tourName) {
+  if (!clientId || !guideId || !tourName) return null;
+  const themeId = await getOrCreateTourTheme(tourName);
+  if (!themeId) return null;
+  try {
+    const existing = await pool.query(
+      `SELECT c.id_chat FROM chats c
+       JOIN participants_chats pc1 ON pc1.chat_id = c.id_chat AND pc1.user_id = $1
+       JOIN participants_chats pc2 ON pc2.chat_id = c.id_chat AND pc2.user_id = $2
+       WHERE c.theme = $3
+       ORDER BY c.id_chat DESC LIMIT 1`,
+      [clientId, guideId, themeId]
+    );
+    if (existing.rows.length > 0) return existing.rows[0].id_chat;
+
+    const chatRes = await pool.query(
+      'INSERT INTO chats (date_chat, theme) VALUES (CURRENT_TIMESTAMP, $1) RETURNING id_chat',
+      [themeId]
+    );
+    const chatId = chatRes.rows[0].id_chat;
+    await pool.query(
+      'INSERT INTO participants_chats (chat_id, user_id) VALUES ($1, $2), ($1, $3)',
+      [chatId, clientId, guideId]
+    );
+    return chatId;
+  } catch (e) {
+    console.warn('Ensure tour chat failed:', e.message);
+    return null;
+  }
+}
+
+async function syncTourChats(userId, roleId) {
+  const bookingVariants = [
+    {
+      join: 'JOIN tours t ON ts.tour = t.id_tour',
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule',
+      guideFilter: 'gt.guide_id = $1',
+      userCol: 'b.user_id'
+    },
+    {
+      join: 'JOIN tours t ON ts.tour_id = t.id_tour',
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule',
+      guideFilter: 'gt.guide_id = $1',
+      userCol: 'b.user_id'
+    }
+  ];
+
+  for (const variant of bookingVariants) {
+    try {
+      if (Number(roleId) === 2) {
+        const { rows } = await pool.query(
+          `SELECT DISTINCT b.user_id AS client_id, t.name_tour, gt.guide_id
+           FROM bookings b
+           JOIN tours_schedule ts ON ${variant.scheduleCol}
+           ${variant.join}
+           JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+           WHERE ${variant.guideFilter}`,
+          [userId]
+        );
+        for (const row of rows) {
+          await ensureTourChat(row.client_id, row.guide_id, row.name_tour);
+        }
+        return;
+      }
+
+      const { rows } = await pool.query(
+        `SELECT DISTINCT b.user_id AS client_id, t.name_tour, gt.guide_id
+         FROM bookings b
+         JOIN tours_schedule ts ON ${variant.scheduleCol}
+         ${variant.join}
+         JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+         WHERE b.user_id = $1`,
+        [userId]
+      );
+      for (const row of rows) {
+        await ensureTourChat(row.client_id, row.guide_id, row.name_tour);
+      }
+      return;
+    } catch (e) {
+      console.warn('Sync tour chats failed:', e.message);
+    }
   }
 }
 
@@ -1207,8 +1358,12 @@ async function getOtherParticipantName(chatId, userId) {
   }
 }
 
-async function queryUserChats(userId, supportOnly) {
+async function queryUserChats(userId, supportOnly, roleId) {
   try {
+    if (!supportOnly) {
+      await syncTourChats(userId, roleId);
+    }
+
     const { rows } = await pool.query(
       `SELECT c.id_chat, c.date_chat, c.theme, t.name_theme AS topic
        FROM chats c
@@ -1220,16 +1375,24 @@ async function queryUserChats(userId, supportOnly) {
     );
     const filtered = [];
     for (const row of rows) {
-      const support = await isSupportTheme(row.theme);
-      if (supportOnly ? support : !support) {
-        const partnerName = await getOtherParticipantName(row.id_chat, userId);
-        filtered.push({
-          id_chat: row.id_chat,
-          topic: row.topic || 'Чат',
-          partner_name: partnerName,
-          date_chat: row.date_chat
-        });
+      const isSupport = await isSupportMetaChat(row.theme);
+      const isTour = await isTourChatTheme(row.theme);
+      if (supportOnly) {
+        if (!isSupport) continue;
+      } else if (!isTour) {
+        continue;
       }
+
+      let partnerName = await getOtherParticipantName(row.id_chat, userId);
+      if (supportOnly) partnerName = 'Поддержка';
+
+      filtered.push({
+        id_chat: row.id_chat,
+        topic: supportOnly ? 'Поддержка' : String(row.topic || 'Чат').replace(/^Тур:\s*/, ''),
+        partner_name: partnerName,
+        date_chat: row.date_chat,
+        is_support: isSupport
+      });
     }
     return filtered;
   } catch (e) {
@@ -1291,11 +1454,30 @@ app.get('/api/guide/:userId/reviews', async (req, res) => {
   }
 });
 
+app.get('/api/chats/support-topics', async (req, res) => {
+  try {
+    const { min, max } = supportTopicRange(req.query.roleId);
+    const { rows } = await pool.query(
+      `SELECT id_theme, name_theme FROM themes
+       WHERE id_theme >= $1 AND id_theme <= $2
+       ORDER BY id_theme`,
+      [min, max]
+    );
+    res.json(rows.map(r => ({
+      id_theme: r.id_theme,
+      name: r.name_theme
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/chats/:userId', async (req, res) => {
   try {
     const userId = req.params.userId;
     const mode = req.query.mode === 'support' ? 'support' : 'regular';
-    const chats = await queryUserChats(userId, mode === 'support');
+    const roleId = req.query.roleId || 1;
+    const chats = await queryUserChats(userId, mode === 'support', roleId);
     res.json(chats);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1309,15 +1491,13 @@ app.post('/api/chats/support', async (req, res) => {
   }
   try {
     const adminId = await findAdminUserId();
-    const themeId = await findSupportThemeId();
+    const themeId = await findSupportMetaThemeId();
     if (!adminId || !themeId) {
       return res.status(500).json({ error: 'Поддержка временно недоступна' });
     }
 
     const existing = await pool.query(
-      `SELECT c.id_chat, t.name_theme AS topic
-       FROM chats c
-       JOIN themes t ON c.theme = t.id_theme
+      `SELECT c.id_chat FROM chats c
        JOIN participants_chats pc1 ON pc1.chat_id = c.id_chat AND pc1.user_id = $1
        JOIN participants_chats pc2 ON pc2.chat_id = c.id_chat AND pc2.user_id = $2
        WHERE c.theme = $3
@@ -1325,11 +1505,11 @@ app.post('/api/chats/support', async (req, res) => {
       [userId, adminId, themeId]
     );
     if (existing.rows.length > 0) {
-      const chat = existing.rows[0];
       return res.json({
-        id_chat: chat.id_chat,
-        topic: chat.topic || 'Поддержка',
-        partner_name: 'Поддержка'
+        id_chat: existing.rows[0].id_chat,
+        topic: 'Поддержка',
+        partner_name: 'Поддержка',
+        is_support: true
       });
     }
 
@@ -1342,7 +1522,7 @@ app.post('/api/chats/support', async (req, res) => {
       'INSERT INTO participants_chats (chat_id, user_id) VALUES ($1, $2), ($1, $3)',
       [chatId, userId, adminId]
     );
-    res.json({ id_chat: chatId, topic: 'Поддержка', partner_name: 'Поддержка' });
+    res.json({ id_chat: chatId, topic: 'Поддержка', partner_name: 'Поддержка', is_support: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1360,12 +1540,18 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
     }
 
     const header = await pool.query(
-      `SELECT t.name_theme AS topic FROM chats c
+      `SELECT c.theme, t.name_theme AS topic FROM chats c
        JOIN themes t ON c.theme = t.id_theme
        WHERE c.id_chat = $1`,
       [chatId]
     );
-    const partnerName = await getOtherParticipantName(chatId, userId);
+    const isSupport = header.rows.length > 0
+      ? await isSupportMetaChat(header.rows[0].theme)
+      : false;
+    const partnerName = isSupport ? 'Поддержка' : await getOtherParticipantName(chatId, userId);
+    const topic = isSupport
+      ? 'Поддержка'
+      : String(header.rows[0]?.topic || 'Чат').replace(/^Тур:\s*/, '');
 
     const { rows } = await pool.query(
       `SELECT m.id_message, m.text_message, m.send_time, pc.user_id, u.fio, u.role_id
@@ -1378,15 +1564,17 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
     );
 
     res.json({
-      topic: header.rows[0]?.topic || 'Чат',
+      topic,
       partner_name: partnerName,
+      is_support: isSupport,
       messages: rows.map(r => ({
         id_message: r.id_message,
         text: r.text_message || '',
         send_time: r.send_time,
         user_id: r.user_id,
         sender_name: r.fio || 'Пользователь',
-        is_mine: String(r.user_id) === String(userId)
+        is_mine: String(r.user_id) === String(userId),
+        is_topic: String(r.text_message || '').startsWith('[Тема:')
       }))
     });
   } catch (err) {
@@ -1396,7 +1584,7 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
 
 app.post('/api/chats/:chatId/messages', async (req, res) => {
   const chatId = req.params.chatId;
-  const { userId, text } = req.body;
+  const { userId, text, themeId, roleId } = req.body;
   if (!userId || !text || !String(text).trim()) {
     return res.status(400).json({ error: 'userId и text обязательны' });
   }
@@ -1405,11 +1593,37 @@ app.post('/api/chats/:chatId/messages', async (req, res) => {
     if (!participantId) {
       return res.status(403).json({ error: 'Нет доступа к чату' });
     }
+
+    const chatInfo = await pool.query('SELECT theme FROM chats WHERE id_chat = $1', [chatId]);
+    const isSupport = chatInfo.rows.length > 0
+      ? await isSupportMetaChat(chatInfo.rows[0].theme)
+      : false;
+
+    let messageText = String(text).trim();
+    if (isSupport) {
+      if (!themeId) {
+        return res.status(400).json({ error: 'Выберите тему обращения' });
+      }
+      const range = supportTopicRange(roleId);
+      const themeNum = Number(themeId);
+      if (themeNum < range.min || themeNum > range.max) {
+        return res.status(400).json({ error: 'Недопустимая тема обращения' });
+      }
+      const themeRes = await pool.query(
+        'SELECT name_theme FROM themes WHERE id_theme = $1',
+        [themeId]
+      );
+      if (themeRes.rows.length === 0) {
+        return res.status(400).json({ error: 'Тема не найдена' });
+      }
+      messageText = `[Тема: ${themeRes.rows[0].name_theme}]\n${messageText}`;
+    }
+
     const result = await pool.query(
       `INSERT INTO messages (participant_id, text_message, send_time)
        VALUES ($1, $2, CURRENT_TIMESTAMP)
        RETURNING id_message, text_message, send_time`,
-      [participantId, String(text).trim()]
+      [participantId, messageText]
     );
     const row = result.rows[0];
     res.json({
@@ -1419,7 +1633,8 @@ app.post('/api/chats/:chatId/messages', async (req, res) => {
         text: row.text_message,
         send_time: row.send_time,
         user_id: userId,
-        is_mine: true
+        is_mine: true,
+        is_topic: String(row.text_message || '').startsWith('[Тема:')
       }
     });
   } catch (err) {
