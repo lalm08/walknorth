@@ -353,14 +353,25 @@ app.get('/api/districts', async (req, res) => {
 
 app.get('/api/district-details/:id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT description, photo_binary FROM districts WHERE id_district = $1', [req.params.id]);
+    const result = await pool.query(
+      'SELECT name_district, description, photo_binary FROM districts WHERE id_district = $1',
+      [req.params.id]
+    );
     const row = result.rows[0];
-    
+    let images = [];
+    if (row?.photo_binary) {
+      const formatted = await formatRows([{ photo_binary: row.photo_binary }], 800);
+      images = formatted.map(p => p.photo_binary).filter(Boolean);
+    }
+
     res.json({
-      description: row.description,
-      images: row.photo_binary ? [row.photo_binary.toString('base64')] : []
+      name: row?.name_district || '',
+      description: row?.description || '',
+      images
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 
@@ -662,18 +673,69 @@ app.get('/api/bookings/:userId', async (req, res) => {
 
 //детали места 
 app.get('/api/place-details/:id', async (req, res) => {
+  const id = req.params.id;
+
   try {
-    const info = await pool.query('SELECT description, ST_Y(location::geometry) as lat, ST_X(location::geometry) as lon FROM places WHERE id_place = $1', [req.params.id]);
-    const photos = await pool.query('SELECT photo_binary FROM photos WHERE place_id = $1', [req.params.id]);
-    const compressedPhotos = await formatRows(photos.rows, 800);
+    const { rows: columns } = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'places'`
+    );
+    const names = columns.map(c => c.column_name);
+    const nameCol = ['name_place', 'name', 'place_name'].find(c => names.includes(c)) || 'name_place';
+    const descCol = ['description', 'description_place', 'text', 'about'].find(c => names.includes(c));
+    const hasLocation = names.includes('location');
+
+    let infoRow = null;
+    if (hasLocation) {
+      const descSelect = descCol ? `p.${descCol}` : "''";
+      const sql = `SELECT p.${nameCol} AS name_place,
+                          ${descSelect} AS description,
+                          ST_Y(p.location::geometry) AS lat,
+                          ST_X(p.location::geometry) AS lon
+                   FROM places p
+                   WHERE p.id_place = $1`;
+      try {
+        const result = await pool.query(sql, [id]);
+        infoRow = result.rows[0] || null;
+      } catch (e) {
+        console.warn('Place info query failed:', e.message);
+      }
+    }
+
+    if (!infoRow) {
+      const fallbackSql = `SELECT ${nameCol} AS name_place
+                           FROM places WHERE id_place = $1`;
+      try {
+        const result = await pool.query(fallbackSql, [id]);
+        infoRow = result.rows[0] || null;
+      } catch (e) {
+        console.warn('Place fallback query failed:', e.message);
+      }
+    }
+
+    let images = [];
+    try {
+      const photos = await pool.query(
+        'SELECT photo_binary FROM photos WHERE place_id = $1',
+        [id]
+      );
+      const compressedPhotos = await formatRows(photos.rows, 800);
+      images = compressedPhotos.map(p => p.photo_binary).filter(Boolean);
+    } catch (e) {
+      console.warn('Place photos unavailable:', e.message);
+    }
+
     res.json({
-      description: info.rows[0]?.description,
-      lat: info.rows[0]?.lat,
-      lon: info.rows[0]?.lon,
-      images: compressedPhotos.map(p => p.photo_binary)
+      name: infoRow?.name_place || '',
+      name_place: infoRow?.name_place || '',
+      description: infoRow?.description || '',
+      description_place: infoRow?.description || '',
+      lat: infoRow?.lat != null ? parseFloat(infoRow.lat) : null,
+      lon: infoRow?.lon != null ? parseFloat(infoRow.lon) : null,
+      images
     });
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -785,12 +847,35 @@ app.get('/api/get-path', async (req, res) => {
 
 app.get('/api/profile/:id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT fio FROM users WHERE id_user = $1', [req.params.id]);
-    if (result.rows.length > 0) {
-      res.json({ name: result.rows[0].fio });
-    } else {
-      res.status(404).json({ error: "Пользователь не найден" });
+    const userId = req.params.id;
+    let row = null;
+    try {
+      const result = await pool.query(
+        `SELECT u.fio, u.phone, u.mail, gp.bio, gp.experience, gp.social_link
+         FROM users u
+         LEFT JOIN guide_profiles gp ON gp.user_id = u.id_user
+         WHERE u.id_user = $1`,
+        [userId]
+      );
+      row = result.rows[0];
+    } catch (e) {
+      const fallback = await pool.query(
+        'SELECT fio, phone, mail FROM users WHERE id_user = $1',
+        [userId]
+      );
+      row = fallback.rows[0];
     }
+    if (!row) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    res.json({
+      name: row.fio || '',
+      phone: row.phone || '',
+      mail: row.mail || '',
+      vk: row.social_link || '',
+      experience: row.experience || '',
+      about: row.bio || ''
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -832,6 +917,511 @@ app.post('/api/login', async (req, res) => {
     } else {
       res.status(401).json({ error: "Неверный логин или пароль" });
     }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+let toursMetaCache = null;
+
+async function getToursTableMeta() {
+  if (toursMetaCache) return toursMetaCache;
+  try {
+    const { rows } = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'tours'`
+    );
+    const names = rows.map(r => r.column_name);
+    toursMetaCache = {
+      guideCol: ['guide_id', 'user_id', 'id_guide', 'guide', 'id_user'].find(c => names.includes(c)),
+      statusCol: ['status_tour', 'status', 'tour_status', 'state'].find(c => names.includes(c)),
+      durationCol: ['duration', 'duration_tour', 'time_tour', 'length'].find(c => names.includes(c))
+    };
+  } catch (e) {
+    toursMetaCache = { guideCol: null, statusCol: null, durationCol: null };
+  }
+  return toursMetaCache;
+}
+
+function normalizeTourStatus(value) {
+  const raw = String(value ?? '1').toLowerCase().trim();
+  if (raw === '2' || raw.includes('скрыт') || raw.includes('hidden')) return 'hidden';
+  if (raw === '3' || raw.includes('черновик') || raw.includes('draft')) return 'draft';
+  return 'active';
+}
+
+function isArchiveStatus(value) {
+  const status = normalizeTourStatus(value);
+  return status === 'hidden' || status === 'draft';
+}
+
+function statusApiToDbCandidates(statusApi) {
+  const map = {
+    active: [1, '1', 'active', 'активен', 'активный'],
+    hidden: [2, '2', 'hidden', 'скрыт', 'скрытый'],
+    draft: [3, '3', 'draft', 'черновик']
+  };
+  return map[statusApi] || map.active;
+}
+
+async function queryGuideTours(guideId, archived) {
+  const meta = await getToursTableMeta();
+  const statusSelect = meta.statusCol ? `, t.${meta.statusCol} AS tour_status` : ", 'active' AS tour_status";
+  const durationSelect = meta.durationCol ? `, t.${meta.durationCol} AS duration` : ", NULL AS duration";
+
+  let sql = `SELECT t.id_tour, t.name_tour, t.price${statusSelect}${durationSelect} FROM tours t`;
+  const params = [];
+  if (meta.guideCol) {
+    sql += ` WHERE t.${meta.guideCol} = $1`;
+    params.push(guideId);
+  }
+  sql += ' ORDER BY t.name_tour';
+
+  const rows = (await pool.query(sql, params)).rows;
+  return rows
+    .map(row => ({
+      id_tour: row.id_tour,
+      name_tour: row.name_tour,
+      price: row.price,
+      duration: row.duration,
+      status: normalizeTourStatus(row.tour_status)
+    }))
+    .filter(row => archived ? isArchiveStatus(row.status) : !isArchiveStatus(row.status));
+}
+
+app.get('/api/guide/:userId/tours', async (req, res) => {
+  try {
+    const archived = req.query.archived === 'true';
+    res.json(await queryGuideTours(req.params.userId, archived));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/guide/tours/:tourId', async (req, res) => {
+  const tourId = req.params.tourId;
+  try {
+    const meta = await getToursTableMeta();
+    const statusSelect = meta.statusCol ? `, ${meta.statusCol} AS tour_status` : ", 'active' AS tour_status";
+    const durationSelect = meta.durationCol ? `, ${meta.durationCol} AS duration` : ", NULL AS duration";
+    const tourRes = await pool.query(
+      `SELECT id_tour, name_tour, description, price${statusSelect}${durationSelect}
+       FROM tours WHERE id_tour = $1`,
+      [tourId]
+    );
+    if (tourRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Тур не найден' });
+    }
+    const tour = tourRes.rows[0];
+    let places = [];
+    try {
+      places = await getTourPlaces(tourId);
+    } catch (e) {
+      console.warn('Guide tour places unavailable:', e.message);
+    }
+    res.json({
+      id_tour: tour.id_tour,
+      name: tour.name_tour,
+      description: tour.description || '',
+      price: tour.price,
+      duration: tour.duration,
+      status: normalizeTourStatus(tour.tour_status),
+      places: places.map(p => ({ id: p.id_place, name: p.name_place || p.name }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/guide/tours/:tourId/status', async (req, res) => {
+  const tourId = req.params.tourId;
+  const { status } = req.body;
+  const allowed = ['active', 'hidden', 'draft'];
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: 'Недопустимый статус' });
+  }
+  try {
+    const meta = await getToursTableMeta();
+    if (!meta.statusCol) {
+      return res.status(400).json({ error: 'Статус туров не поддерживается в базе данных' });
+    }
+    const candidates = statusApiToDbCandidates(status);
+    let updated = false;
+    for (const value of candidates) {
+      try {
+        const result = await pool.query(
+          `UPDATE tours SET ${meta.statusCol} = $1 WHERE id_tour = $2 RETURNING id_tour`,
+          [value, tourId]
+        );
+        if (result.rows.length > 0) {
+          updated = true;
+          break;
+        }
+      } catch (e) {
+        console.warn('Status update failed:', e.message);
+      }
+    }
+    if (!updated) {
+      return res.status(500).json({ error: 'Не удалось обновить статус' });
+    }
+    res.json({ success: true, status });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/guide/:userId/bookings', async (req, res) => {
+  const guideId = req.params.userId;
+  const meta = await getToursTableMeta();
+  const variants = [
+    {
+      join: 'JOIN tours t ON ts.tour = t.id_tour',
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule'
+    },
+    {
+      join: 'JOIN tours t ON ts.tour_id = t.id_tour',
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule'
+    },
+    {
+      join: 'JOIN tours t ON ts.tour_id = t.id_tour',
+      scheduleCol: 'b.tour_schedule_id = ts.id_tour_schedule'
+    }
+  ];
+
+  try {
+    let rows = [];
+    for (const variant of variants) {
+      try {
+        let sql = `SELECT b.id_booking, t.id_tour, t.name_tour, ts.datetime_start,
+                          b.count_people, u.fio AS client_name
+                   FROM bookings b
+                   JOIN tours_schedule ts ON ${variant.scheduleCol}
+                   ${variant.join}
+                   LEFT JOIN users u ON b.user_id = u.id_user`;
+        const params = [];
+        if (meta.guideCol) {
+          sql += ` WHERE t.${meta.guideCol} = $1`;
+          params.push(guideId);
+        }
+        sql += ' ORDER BY ts.datetime_start DESC';
+        rows = (await pool.query(sql, params)).rows;
+        if (rows.length > 0 || meta.guideCol) break;
+      } catch (e) {
+        console.warn('Guide bookings query failed:', e.message);
+      }
+    }
+    res.json(rows.map(r => ({
+      id_booking: r.id_booking,
+      id_tour: r.id_tour,
+      name_tour: r.name_tour,
+      datetime_start: r.datetime_start,
+      count_people: r.count_people || 1,
+      client_name: r.client_name || 'Клиент'
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function findAdminUserId() {
+  const queries = [
+    `SELECT u.id_user FROM users u
+     JOIN roles r ON u.role_id = r.id_role
+     WHERE LOWER(r.name_role) LIKE '%admin%' OR LOWER(r.name_role) LIKE '%админ%'
+     ORDER BY u.id_user LIMIT 1`,
+    'SELECT id_user FROM users WHERE role_id >= 3 ORDER BY id_user LIMIT 1',
+    'SELECT id_user FROM users WHERE role_id = 3 ORDER BY id_user LIMIT 1'
+  ];
+  for (const sql of queries) {
+    try {
+      const { rows } = await pool.query(sql);
+      if (rows.length > 0) return rows[0].id_user;
+    } catch (e) {
+      console.warn('Admin lookup failed:', e.message);
+    }
+  }
+  return null;
+}
+
+async function findSupportThemeId() {
+  const queries = [
+    `SELECT id_theme FROM themes
+     WHERE LOWER(name_theme) LIKE '%поддерж%' OR LOWER(name_theme) LIKE '%support%'
+     ORDER BY id_theme LIMIT 1`,
+    'SELECT id_theme FROM themes ORDER BY id_theme LIMIT 1'
+  ];
+  for (const sql of queries) {
+    try {
+      const { rows } = await pool.query(sql);
+      if (rows.length > 0) return rows[0].id_theme;
+    } catch (e) {
+      console.warn('Support theme lookup failed:', e.message);
+    }
+  }
+  try {
+    const created = await pool.query(
+      `INSERT INTO themes (name_theme) VALUES ('Поддержка') RETURNING id_theme`
+    );
+    return created.rows[0].id_theme;
+  } catch (e) {
+    console.warn('Support theme create failed:', e.message);
+    return null;
+  }
+}
+
+async function isSupportTheme(themeId) {
+  try {
+    const { rows } = await pool.query('SELECT name_theme FROM themes WHERE id_theme = $1', [themeId]);
+    if (rows.length === 0) return false;
+    const name = String(rows[0].name_theme || '').toLowerCase();
+    return name.includes('поддерж') || name.includes('support') || name.includes('админ');
+  } catch (e) {
+    return false;
+  }
+}
+
+async function getChatParticipantId(chatId, userId) {
+  const { rows } = await pool.query(
+    'SELECT id_participant FROM participants_chats WHERE chat_id = $1 AND user_id = $2',
+    [chatId, userId]
+  );
+  return rows.length > 0 ? rows[0].id_participant : null;
+}
+
+async function userInChat(chatId, userId) {
+  return (await getChatParticipantId(chatId, userId)) != null;
+}
+
+async function getOtherParticipantName(chatId, userId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.fio FROM participants_chats pc
+       JOIN users u ON pc.user_id = u.id_user
+       WHERE pc.chat_id = $1 AND pc.user_id <> $2
+       ORDER BY pc.id_participant LIMIT 1`,
+      [chatId, userId]
+    );
+    return rows.length > 0 ? rows[0].fio : 'Собеседник';
+  } catch (e) {
+    return 'Собеседник';
+  }
+}
+
+async function queryUserChats(userId, supportOnly) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.id_chat, c.date_chat, c.theme, t.name_theme AS topic
+       FROM chats c
+       JOIN themes t ON c.theme = t.id_theme
+       JOIN participants_chats pc ON pc.chat_id = c.id_chat
+       WHERE pc.user_id = $1
+       ORDER BY c.date_chat DESC NULLS LAST, c.id_chat DESC`,
+      [userId]
+    );
+    const filtered = [];
+    for (const row of rows) {
+      const support = await isSupportTheme(row.theme);
+      if (supportOnly ? support : !support) {
+        const partnerName = await getOtherParticipantName(row.id_chat, userId);
+        filtered.push({
+          id_chat: row.id_chat,
+          topic: row.topic || 'Чат',
+          partner_name: partnerName,
+          date_chat: row.date_chat
+        });
+      }
+    }
+    return filtered;
+  } catch (e) {
+    console.warn('User chats query failed:', e.message);
+    return [];
+  }
+}
+
+app.get('/api/guide/:userId/reviews', async (req, res) => {
+  const guideId = req.params.userId;
+  const variants = [
+    `SELECT r.id_review, COALESCE(b.date_booking, r.id_review::text) AS review_date,
+            u.fio AS client_name, r.rating, r.comment AS text
+     FROM reviews r
+     JOIN bookings b ON r.booking_id = b.id_booking
+     JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+     JOIN guides_and_tours gt ON ts.tour_id = gt.tour_id
+     JOIN users u ON b.user_id = u.id_user
+     WHERE gt.guide_id = $1
+     ORDER BY r.id_review DESC`,
+    `SELECT r.id_review, COALESCE(b.date_booking, r.id_review::text) AS review_date,
+            u.fio AS client_name, r.rating, r.text_review AS text
+     FROM reviews r
+     JOIN bookings b ON r.booking_id = b.id_booking
+     JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+     JOIN guides_and_tours gt ON ts.tour_id = gt.tour_id
+     JOIN users u ON b.user_id = u.id_user
+     WHERE gt.guide_id = $1
+     ORDER BY r.id_review DESC`,
+    `SELECT r.id_review, COALESCE(b.date_booking, r.id_review::text) AS review_date,
+            u.fio AS client_name, r.rating, COALESCE(r.comment, r.text_review) AS text
+     FROM reviews r
+     JOIN bookings b ON r.booking_id = b.id_booking
+     JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+     JOIN tours t ON ts.tour = t.id_tour
+     JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
+     JOIN users u ON b.user_id = u.id_user
+     WHERE gt.guide_id = $1
+     ORDER BY r.id_review DESC`
+  ];
+  try {
+    for (const sql of variants) {
+      try {
+        const { rows } = await pool.query(sql, [guideId]);
+        return res.json(rows.map(r => ({
+          id_review: r.id_review,
+          date: r.review_date,
+          client_name: r.client_name || 'Клиент',
+          rating: r.rating,
+          comment: r.text || ''
+        })));
+      } catch (e) {
+        console.warn('Guide reviews query failed:', e.message);
+      }
+    }
+    res.json([]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/chats/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const mode = req.query.mode === 'support' ? 'support' : 'regular';
+    const chats = await queryUserChats(userId, mode === 'support');
+    res.json(chats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/chats/support', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId обязателен' });
+  }
+  try {
+    const adminId = await findAdminUserId();
+    const themeId = await findSupportThemeId();
+    if (!adminId || !themeId) {
+      return res.status(500).json({ error: 'Поддержка временно недоступна' });
+    }
+
+    const existing = await pool.query(
+      `SELECT c.id_chat, t.name_theme AS topic
+       FROM chats c
+       JOIN themes t ON c.theme = t.id_theme
+       JOIN participants_chats pc1 ON pc1.chat_id = c.id_chat AND pc1.user_id = $1
+       JOIN participants_chats pc2 ON pc2.chat_id = c.id_chat AND pc2.user_id = $2
+       WHERE c.theme = $3
+       ORDER BY c.id_chat DESC LIMIT 1`,
+      [userId, adminId, themeId]
+    );
+    if (existing.rows.length > 0) {
+      const chat = existing.rows[0];
+      return res.json({
+        id_chat: chat.id_chat,
+        topic: chat.topic || 'Поддержка',
+        partner_name: 'Поддержка'
+      });
+    }
+
+    const chatRes = await pool.query(
+      'INSERT INTO chats (date_chat, theme) VALUES (CURRENT_TIMESTAMP, $1) RETURNING id_chat',
+      [themeId]
+    );
+    const chatId = chatRes.rows[0].id_chat;
+    await pool.query(
+      'INSERT INTO participants_chats (chat_id, user_id) VALUES ($1, $2), ($1, $3)',
+      [chatId, userId, adminId]
+    );
+    res.json({ id_chat: chatId, topic: 'Поддержка', partner_name: 'Поддержка' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/chats/:chatId/messages', async (req, res) => {
+  const chatId = req.params.chatId;
+  const userId = req.query.userId;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId обязателен' });
+  }
+  try {
+    if (!(await userInChat(chatId, userId))) {
+      return res.status(403).json({ error: 'Нет доступа к чату' });
+    }
+
+    const header = await pool.query(
+      `SELECT t.name_theme AS topic FROM chats c
+       JOIN themes t ON c.theme = t.id_theme
+       WHERE c.id_chat = $1`,
+      [chatId]
+    );
+    const partnerName = await getOtherParticipantName(chatId, userId);
+
+    const { rows } = await pool.query(
+      `SELECT m.id_message, m.text_message, m.send_time, pc.user_id, u.fio, u.role_id
+       FROM messages m
+       JOIN participants_chats pc ON m.participant_id = pc.id_participant
+       JOIN users u ON pc.user_id = u.id_user
+       WHERE pc.chat_id = $1
+       ORDER BY m.send_time ASC NULLS LAST, m.id_message ASC`,
+      [chatId]
+    );
+
+    res.json({
+      topic: header.rows[0]?.topic || 'Чат',
+      partner_name: partnerName,
+      messages: rows.map(r => ({
+        id_message: r.id_message,
+        text: r.text_message || '',
+        send_time: r.send_time,
+        user_id: r.user_id,
+        sender_name: r.fio || 'Пользователь',
+        is_mine: String(r.user_id) === String(userId)
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/chats/:chatId/messages', async (req, res) => {
+  const chatId = req.params.chatId;
+  const { userId, text } = req.body;
+  if (!userId || !text || !String(text).trim()) {
+    return res.status(400).json({ error: 'userId и text обязательны' });
+  }
+  try {
+    const participantId = await getChatParticipantId(chatId, userId);
+    if (!participantId) {
+      return res.status(403).json({ error: 'Нет доступа к чату' });
+    }
+    const result = await pool.query(
+      `INSERT INTO messages (participant_id, text_message, send_time)
+       VALUES ($1, $2, CURRENT_TIMESTAMP)
+       RETURNING id_message, text_message, send_time`,
+      [participantId, String(text).trim()]
+    );
+    const row = result.rows[0];
+    res.json({
+      success: true,
+      message: {
+        id_message: row.id_message,
+        text: row.text_message,
+        send_time: row.send_time,
+        user_id: userId,
+        is_mine: true
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
