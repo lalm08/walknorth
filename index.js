@@ -611,7 +611,8 @@ function groupClientBookings(rows) {
         price: formatPriceValue(row.price),
         datetime_start: row.datetime_start,
         datetime_end: row.datetime_end,
-        count_people: row.count_people || 1
+        count_people: row.count_people || 1,
+        can_cancel: isFutureSchedule({ datetime_start: row.datetime_start })
       });
     }
   }
@@ -707,23 +708,24 @@ app.post('/api/bookings', async (req, res) => {
 
     try {
       const tourInfoVariants = [
-        `SELECT t.name_tour, gt.guide_id
+        `SELECT t.id_tour, t.name_tour
          FROM tours_schedule ts
          JOIN tours t ON ts.tour = t.id_tour
-         JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
          WHERE ts.id_tour_schedule = $1`,
-        `SELECT t.name_tour, gt.guide_id
+        `SELECT t.id_tour, t.name_tour
          FROM tours_schedule ts
          JOIN tours t ON ts.tour_id = t.id_tour
-         JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
          WHERE ts.id_tour_schedule = $1`
       ];
       for (const sql of tourInfoVariants) {
         try {
           const tourInfo = await pool.query(sql, [scheduleId]);
           if (tourInfo.rows.length > 0) {
-            const { name_tour, guide_id } = tourInfo.rows[0];
-            await ensureTourChat(userId, guide_id, name_tour);
+            const { id_tour, name_tour } = tourInfo.rows[0];
+            const guide_id = await resolveGuideIdForTour(id_tour);
+            if (guide_id) {
+              await ensureTourChat(userId, guide_id, name_tour);
+            }
             break;
           }
         } catch (e) {
@@ -735,6 +737,59 @@ app.post('/api/bookings', async (req, res) => {
     }
 
     res.json({ success: true, bookingId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/bookings/cancel', async (req, res) => {
+  const { userId, id_booking } = req.body;
+  if (!userId || userId === -1 || !id_booking) {
+    return res.status(400).json({ error: 'userId и id_booking обязательны' });
+  }
+  try {
+    const bookingVariants = [
+      {
+        join: 'JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule',
+        tourJoin: 'JOIN tours t ON ts.tour = t.id_tour'
+      },
+      {
+        join: 'JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule',
+        tourJoin: 'JOIN tours t ON ts.tour_id = t.id_tour'
+      }
+    ];
+
+    let bookingRow = null;
+    for (const variant of bookingVariants) {
+      try {
+        const { rows } = await pool.query(
+          `SELECT b.id_booking, b.user_id, b.tour_schedule, ts.datetime_start
+           FROM bookings b
+           ${variant.join}
+           WHERE b.id_booking = $1 AND b.user_id = $2`,
+          [id_booking, userId]
+        );
+        if (rows.length > 0) {
+          bookingRow = rows[0];
+          break;
+        }
+      } catch (e) {
+        console.warn('Cancel booking lookup failed:', e.message);
+      }
+    }
+
+    if (!bookingRow) {
+      return res.status(404).json({ error: 'Бронирование не найдено' });
+    }
+    if (!isFutureSchedule({ datetime_start: bookingRow.datetime_start })) {
+      return res.status(400).json({ error: 'Нельзя отменить прошедшее бронирование' });
+    }
+
+    await pool.query(
+      'DELETE FROM bookings WHERE user_id = $1 AND tour_schedule = $2',
+      [userId, bookingRow.tour_schedule]
+    );
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1325,6 +1380,37 @@ async function getGuideIdForTour(tourId) {
   }
 }
 
+async function resolveGuideIdForTour(tourId) {
+  if (!tourId) return null;
+  let guideId = await getGuideIdForTour(tourId);
+  if (guideId) return guideId;
+  try {
+    const meta = await getToursTableMeta();
+    if (meta.guideCol) {
+      const { rows } = await pool.query(
+        `SELECT ${meta.guideCol} AS guide_id FROM tours WHERE id_tour = $1`,
+        [tourId]
+      );
+      if (rows.length > 0 && rows[0].guide_id) return rows[0].guide_id;
+    }
+  } catch (e) {
+    console.warn('Guide resolve via tours failed:', e.message);
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id_user FROM users u
+       JOIN guides_and_tours gt ON gt.guide_id = u.id_user
+       WHERE gt.tour_id = $1 AND u.role_id = 2
+       ORDER BY u.id_user LIMIT 1`,
+      [tourId]
+    );
+    if (rows.length > 0) return rows[0].id_user;
+  } catch (e) {
+    console.warn('Guide resolve via users failed:', e.message);
+  }
+  return null;
+}
+
 async function ensureTourChat(clientId, guideId, tourName) {
   if (!clientId || !guideId || !tourName) return null;
   const themeId = await getOrCreateTourTheme(tourName);
@@ -1357,50 +1443,48 @@ async function ensureTourChat(clientId, guideId, tourName) {
 }
 
 async function syncTourChats(userId, roleId) {
-  const bookingVariants = [
+  const variants = [
     {
       join: 'JOIN tours t ON ts.tour = t.id_tour',
-      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule',
-      guideFilter: 'gt.guide_id = $1',
-      userCol: 'b.user_id'
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule'
     },
     {
       join: 'JOIN tours t ON ts.tour_id = t.id_tour',
-      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule',
-      guideFilter: 'gt.guide_id = $1',
-      userCol: 'b.user_id'
+      scheduleCol: 'b.tour_schedule = ts.id_tour_schedule'
+    },
+    {
+      join: 'JOIN tours t ON ts.tour_id = t.id_tour',
+      scheduleCol: 'b.tour_schedule_id = ts.id_tour_schedule'
     }
   ];
 
-  for (const variant of bookingVariants) {
+  for (const variant of variants) {
     try {
+      let sql = `SELECT DISTINCT b.user_id AS client_id, t.id_tour, t.name_tour
+                 FROM bookings b
+                 JOIN tours_schedule ts ON ${variant.scheduleCol}
+                 ${variant.join}`;
+      const params = [];
       if (Number(roleId) === 2) {
-        const { rows } = await pool.query(
-          `SELECT DISTINCT b.user_id AS client_id, t.name_tour, gt.guide_id
-           FROM bookings b
-           JOIN tours_schedule ts ON ${variant.scheduleCol}
-           ${variant.join}
-           JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
-           WHERE ${variant.guideFilter}`,
-          [userId]
-        );
-        for (const row of rows) {
-          await ensureTourChat(row.client_id, row.guide_id, row.name_tour);
+        const meta = await getToursTableMeta();
+        if (meta.guideCol) {
+          sql += ` WHERE t.${meta.guideCol} = $1`;
+          params.push(userId);
+        } else {
+          sql += ` JOIN guides_and_tours gt ON t.id_tour = gt.tour_id WHERE gt.guide_id = $1`;
+          params.push(userId);
         }
-        return;
+      } else {
+        sql += ` WHERE b.user_id = $1`;
+        params.push(userId);
       }
 
-      const { rows } = await pool.query(
-        `SELECT DISTINCT b.user_id AS client_id, t.name_tour, gt.guide_id
-         FROM bookings b
-         JOIN tours_schedule ts ON ${variant.scheduleCol}
-         ${variant.join}
-         JOIN guides_and_tours gt ON t.id_tour = gt.tour_id
-         WHERE b.user_id = $1`,
-        [userId]
-      );
+      const { rows } = await pool.query(sql, params);
       for (const row of rows) {
-        await ensureTourChat(row.client_id, row.guide_id, row.name_tour);
+        const guideId = await resolveGuideIdForTour(row.id_tour);
+        if (guideId) {
+          await ensureTourChat(row.client_id, guideId, row.name_tour);
+        }
       }
       return;
     } catch (e) {
@@ -1534,7 +1618,19 @@ app.get('/api/guide/:userId/reviews', async (req, res) => {
 
 app.get('/api/chats/support-topics', async (req, res) => {
   try {
-    const { min, max } = supportTopicRange(req.query.roleId);
+    let roleId = Number(req.query.roleId);
+    if (req.query.userId) {
+      try {
+        const { rows } = await pool.query(
+          'SELECT role_id FROM users WHERE id_user = $1',
+          [req.query.userId]
+        );
+        if (rows.length > 0) roleId = rows[0].role_id;
+      } catch (e) {
+        console.warn('Support topics role lookup failed:', e.message);
+      }
+    }
+    const { min, max } = supportTopicRange(roleId);
     const { rows } = await pool.query(
       `SELECT id_theme, name_theme FROM themes
        WHERE id_theme >= $1 AND id_theme <= $2
@@ -1682,7 +1778,14 @@ app.post('/api/chats/:chatId/messages', async (req, res) => {
       if (!themeId) {
         return res.status(400).json({ error: 'Выберите тему обращения' });
       }
-      const range = supportTopicRange(roleId);
+      let effectiveRoleId = Number(roleId);
+      try {
+        const { rows } = await pool.query('SELECT role_id FROM users WHERE id_user = $1', [userId]);
+        if (rows.length > 0) effectiveRoleId = rows[0].role_id;
+      } catch (e) {
+        console.warn('Message role lookup failed:', e.message);
+      }
+      const range = supportTopicRange(effectiveRoleId);
       const themeNum = Number(themeId);
       if (themeNum < range.min || themeNum > range.max) {
         return res.status(400).json({ error: 'Недопустимая тема обращения' });
