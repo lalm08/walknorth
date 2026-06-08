@@ -2365,4 +2365,38 @@ app.get('/api/admin/profile/:userId', async (req, res) => {
   }
 });
 
+app.post('/api/sos', async (req, res) => {
+  const { userId, lat, lon, tourName, roleLabel } = req.body;
+  if (lat == null || lon == null) {
+    return res.status(400).json({ error: 'Координаты обязательны' });
+  }
+  try {
+    let fio = 'Пользователь';
+    let phone = '';
+    if (userId) {
+      const { rows } = await pool.query(
+        'SELECT fio, phone FROM users WHERE id_user = $1',
+        [userId]
+      );
+      if (rows.length > 0) {
+        fio = rows[0].fio || fio;
+        phone = rows[0].phone || '';
+      }
+    }
+    const mapLink = `https://www.google.com/maps?q=${lat},${lon}`;
+    const text = [
+      'SOS-сигнал WalkNorth',
+      `От: ${fio} (${roleLabel || 'Пользователь'})`,
+      phone ? `Телефон: ${phone}` : null,
+      `Тур: ${tourName || '—'}`,
+      `Координаты: ${lat}, ${lon}`,
+      `Карта: ${mapLink}`
+    ].filter(Boolean).join('\n');
+    console.log('SOS ALERT:\n' + text);
+    res.json({ sent: false, logged: true, message: text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
