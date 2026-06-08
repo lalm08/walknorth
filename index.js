@@ -560,55 +560,32 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
         console.warn('Tour routes query failed:', e.message);
       }
     }
-    const isRiverTour = tourId >= 5 && tourId <= 7;
+    const isRiverTour = routeIds.length >= 2;
     const segments = [];
 
-    if (isRiverTour) {
-      if (routeIds.length >= 2) {
-        const carPoints = await getRoutePoints(routeIds[0]);
-        const boatPoints = await getRoutePoints(routeIds[1]);
-        let boatPath = await getRoutePathFromDb(routeIds[1]);
-        if (boatPath.length === 0) {
-          boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
-        }
-        segments.push({
-          type: 'car',
-          label: 'Дорога на машине',
-          points: carPoints,
-          path: await getRoadPath(carPoints, 'driving-car')
-        });
-        segments.push({
-          type: 'boat',
-          label: 'Сплав на лодке',
-          points: boatPoints,
-          path: boatPath
-        });
-      } else if (routeIds.length === 1) {
-        const points = await getRoutePoints(routeIds[0]);
-        const splitIndex = Math.max(1, Math.ceil(points.length / 2));
-        const carPoints = points.slice(0, splitIndex);
-        const boatPoints = points.slice(splitIndex - 1);
-        segments.push({
-          type: 'car',
-          label: 'Дорога на машине',
-          points: carPoints,
-          path: await getRoadPath(carPoints, 'driving-car')
-        });
-        segments.push({
-          type: 'boat',
-          label: 'Сплав на лодке',
-          points: boatPoints,
-          path: boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }))
-        });
-      }
+    if (routeIds.length >= 2) {
+      const carPoints = await getRoutePoints(routeIds[0]);
+      const boatPoints = await getRoutePoints(routeIds[1]);
+      const boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+      segments.push({
+        type: 'car',
+        label: 'Дорога на машине',
+        points: carPoints,
+        path: await getRoadPath(carPoints, 'driving-car')
+      });
+      segments.push({
+        type: 'boat',
+        label: 'Участок без дороги',
+        points: boatPoints,
+        path: boatPath
+      });
     } else if (routeIds.length > 0) {
       const points = await getRoutePoints(routeIds[0]);
-      const path = await getRoadPath(points, 'driving-car');
       segments.push({
         type: 'car',
         label: 'Маршрут на машине',
         points,
-        path
+        path: await getRoadPath(points, 'driving-car')
       });
     }
 
@@ -2172,7 +2149,7 @@ app.get('/api/admin/content/place/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT p.id_place, p.name_place, p.description, p.address,
-              d.name_district, tp.name_type_place AS type_name,
+              d.name_district, tp.name_type AS type_name,
               ST_Y(p.location::geometry) AS lat,
               ST_X(p.location::geometry) AS lon
        FROM places p
@@ -2216,7 +2193,7 @@ app.get('/api/admin/content/route/:id', async (req, res) => {
     if (meta.rows.length === 0) return res.status(404).json({ error: 'Маршрут не найден' });
     const row = meta.rows[0];
     const points = await getRoutePoints(id);
-    const path = await getRoadPath(points, 'driving-car');
+    const path = await getRoadPath(points, 'foot-walking');
     res.json({
       type: 'route',
       id: parseInt(id, 10),
@@ -2290,17 +2267,18 @@ app.get('/api/admin/content/tour/:id', async (req, res) => {
       }
     }
 
-    const isRiverTour = tourId >= 5 && tourId <= 7;
     const segments = [];
-    if (isRiverTour && routeIds.length >= 2) {
+    if (routeIds.length >= 2) {
       const carPoints = await getRoutePoints(routeIds[0]);
       const boatPoints = await getRoutePoints(routeIds[1]);
-      let boatPath = await getRoutePathFromDb(routeIds[1]);
-      if (boatPath.length === 0) {
-        boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
-      }
-      segments.push({ type: 'car', label: 'Дорога на машине', points: carPoints, path: await getRoadPath(carPoints, 'driving-car') });
-      segments.push({ type: 'boat', label: 'Сплав на лодке', points: boatPoints, path: boatPath });
+      const boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+      segments.push({
+        type: 'car',
+        label: 'Дорога на машине',
+        points: carPoints,
+        path: await getRoadPath(carPoints, 'driving-car')
+      });
+      segments.push({ type: 'boat', label: 'Участок без дороги', points: boatPoints, path: boatPath });
     } else if (routeIds.length > 0) {
       const points = await getRoutePoints(routeIds[0]);
       segments.push({
@@ -2319,8 +2297,8 @@ app.get('/api/admin/content/tour/:id', async (req, res) => {
       description: tour.description || '',
       price: tour.price,
       duration: formatTourDuration(tour.duration),
-      season_start: tour.season_start,
-      season_end: tour.season_end,
+      season_start: tour.season_start || null,
+      season_end: tour.season_end || null,
       max_people: tour.max_people,
       places: places.map(p => ({ id: p.id_place, name: p.name_place || p.name })),
       segments
