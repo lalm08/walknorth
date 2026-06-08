@@ -1,7 +1,25 @@
 const express = require('express');
 const { Pool } = require('pg');
-const sharp = require('sharp'); 
+const sharp = require('sharp');
+const bcrypt = require('bcrypt');
+const BCRYPT_ROUNDS = 10;
 const app = express();
+
+function isBcryptHash(value) {
+  return typeof value === 'string' && /^\$2[aby]\$/.test(value);
+}
+
+async function verifyPassword(plain, stored) {
+  if (!stored) return false;
+  if (isBcryptHash(stored)) {
+    return bcrypt.compare(plain, stored);
+  }
+  return plain === stored;
+}
+
+async function hashPassword(plain) {
+  return bcrypt.hash(plain, BCRYPT_ROUNDS);
+}
 const PORT = process.env.PORT || 3000;
 const axios = require('axios');
 
@@ -1075,10 +1093,11 @@ app.get('/api/profile/:id', async (req, res) => {
 app.post('/api/register', async (req, res) => {
   const { fio, login, mail, phone, pass } = req.body;
   try {
+    const hashedPass = await hashPassword(pass);
     const result = await pool.query(
       `INSERT INTO users (fio, login, mail, phone, pass, role_id, created) 
        VALUES ($1, $2, $3, $4, $5, 1, CURRENT_TIMESTAMP) RETURNING id_user`,
-      [fio, login, mail, phone, pass]
+      [fio, login, mail, phone, hashedPass]
     );
     res.json({ success: true, userId: result.rows[0].id_user });
   } catch (err) {
@@ -1092,21 +1111,31 @@ app.post('/api/login', async (req, res) => {
   const { login, pass } = req.body;
   try {
     const result = await pool.query(
-      'SELECT id_user, fio, role_id FROM users WHERE login = $1 AND pass = $2',
-      [login, pass]
+      'SELECT id_user, fio, role_id, pass FROM users WHERE login = $1',
+      [login]
     );
 
-    if (result.rows.length > 0) {
-      const user = result.rows[0];
-      res.json({ 
-        success: true, 
-        userId: user.id_user, 
-        roleId: user.role_id,
-        name: user.fio
-      });
-    } else {
-      res.status(401).json({ error: "Неверный логин или пароль" });
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Неверный логин или пароль" });
     }
+
+    const user = result.rows[0];
+    const valid = await verifyPassword(pass, user.pass);
+    if (!valid) {
+      return res.status(401).json({ error: "Неверный логин или пароль" });
+    }
+
+    if (!isBcryptHash(user.pass)) {
+      const hashedPass = await hashPassword(pass);
+      await pool.query('UPDATE users SET pass = $1 WHERE id_user = $2', [hashedPass, user.id_user]);
+    }
+
+    res.json({
+      success: true,
+      userId: user.id_user,
+      roleId: user.role_id,
+      name: user.fio
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1917,8 +1946,7 @@ const GUIDE_STATUS_MAP = { active: 1, review: 3, suspended: 2 };
 async function getLatestGuideStatusId(guideId) {
   try {
     const { rows } = await pool.query(
-      `SELECT status_verification_id FROM guide_verifications
-       WHERE guide_id = $1 ORDER BY id_verification DESC LIMIT 1`,
+      `SELECT status_verification_id FROM guide_verifications WHERE guide_id = $1 ORDER BY id_verification DESC LIMIT 1`,
       [guideId]
     );
     return rows.length > 0 ? rows[0].status_verification_id : 3;
@@ -2013,8 +2041,7 @@ app.get('/api/admin/guides/:guideId', async (req, res) => {
     let organizations = [];
     try {
       const orgRes = await pool.query(
-        `SELECT DISTINCT o.name_organization
-         FROM organization_users ou
+        `SELECT DISTINCT o.name_organization FROM organization_users ou
          JOIN organizations o ON o.id_organization = ou.organization_id
          WHERE ou.user_id = $1`,
         [profile.id_user]
@@ -2027,11 +2054,9 @@ app.get('/api/admin/guides/:guideId', async (req, res) => {
     let tours = [];
     try {
       const toursRes = await pool.query(
-        `SELECT t.id_tour, t.name_tour
-         FROM guides_and_tours gt
+        `SELECT t.id_tour, t.name_tour FROM guides_and_tours gt
          JOIN tours t ON t.id_tour = gt.tour_id
-         WHERE gt.guide_id = $1
-         ORDER BY t.name_tour`,
+         WHERE gt.guide_id = $1 ORDER BY t.name_tour`,
         [guideId]
       );
       tours = toursRes.rows;
@@ -2087,8 +2112,7 @@ app.get('/api/admin/content', async (req, res) => {
   const params = [limit, offset, q];
 
   if (type === 'places') {
-    sql = `SELECT DISTINCT ON (p.id_place) p.id_place AS id, p.name_place AS name, ph.photo_binary
-           FROM places p
+    sql = `SELECT DISTINCT ON (p.id_place) p.id_place AS id, p.name_place AS name, ph.photo_binary FROM places p
            LEFT JOIN photos ph ON p.id_place = ph.place_id
            WHERE ($3 = '' OR LOWER(p.name_place) LIKE '%' || $3 || '%')`;
     if (districts) {
@@ -2104,8 +2128,7 @@ app.get('/api/admin/content', async (req, res) => {
            (SELECT photo_binary FROM photos ph
             JOIN place_and_route pr ON ph.place_id = pr.place_id
             WHERE pr.route_id = r.id_route LIMIT 1) AS photo_binary
-           FROM routes r
-           WHERE ($3 = '' OR LOWER(r.name_route) LIKE '%' || $3 || '%')`;
+           FROM routes r WHERE ($3 = '' OR LOWER(r.name_route) LIKE '%' || $3 || '%')`;
     if (districts) {
       const ids = districts.split(',').map(d => parseInt(d, 10)).filter(Boolean);
       if (ids.length > 0) {
@@ -2180,14 +2203,12 @@ app.get('/api/admin/content/route/:id', async (req, res) => {
   const id = req.params.id;
   try {
     const meta = await pool.query(
-      `SELECT r.name_route, r.description, r.duration::text AS duration,
-              string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
+      `SELECT r.name_route, r.description, r.duration::text AS duration, string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
        FROM routes r
        LEFT JOIN place_and_route par ON par.route_id = r.id_route
        LEFT JOIN places p ON p.id_place = par.place_id
        LEFT JOIN districts d ON d.id_district = p.district_id
-       WHERE r.id_route = $1
-       GROUP BY r.id_route, r.name_route, r.description, r.duration`,
+       WHERE r.id_route = $1 GROUP BY r.id_route, r.name_route, r.description, r.duration`,
       [id]
     );
     if (meta.rows.length === 0) return res.status(404).json({ error: 'Маршрут не найден' });
@@ -2217,8 +2238,7 @@ app.get('/api/admin/content/tour/:id', async (req, res) => {
       ? `, ${meta.durationCol}::text AS duration`
       : ", NULL AS duration";
     const tourRes = await pool.query(
-      `SELECT t.id_tour, t.name_tour, t.description, t.price,
-              t.season_start, t.season_end, t.max_people${durationSelect}
+      `SELECT t.id_tour, t.name_tour, t.description, t.price, t.season_start, t.season_end, t.max_people${durationSelect}
        FROM tours t WHERE t.id_tour = $1`,
       [tourId]
     );
@@ -2228,8 +2248,7 @@ app.get('/api/admin/content/tour/:id', async (req, res) => {
     let districts = '';
     try {
       const distRes = await pool.query(
-        `SELECT string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
-         FROM route_and_tour rat
+        `SELECT string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts FROM route_and_tour rat
          JOIN place_and_route par ON par.route_id = rat.route_id
          JOIN places p ON p.id_place = par.place_id
          JOIN districts d ON d.id_district = p.district_id
@@ -2320,13 +2339,11 @@ app.get('/api/admin/chats', async (req, res) => {
     if (!metaThemeId) return res.json([]);
 
     const { rows } = await pool.query(
-      `SELECT c.id_chat, c.date_chat, u.fio, u.role_id, u.id_user
-       FROM chats c
+      `SELECT c.id_chat, c.date_chat, u.fio, u.role_id, u.id_user FROM chats c
        JOIN participants_chats pc_admin ON pc_admin.chat_id = c.id_chat AND pc_admin.user_id = $1
        JOIN participants_chats pc_other ON pc_other.chat_id = c.id_chat AND pc_other.user_id <> $1
        JOIN users u ON u.id_user = pc_other.user_id
-       WHERE c.theme = $2 AND u.role_id = $3
-       ORDER BY c.date_chat DESC NULLS LAST, c.id_chat DESC`,
+       WHERE c.theme = $2 AND u.role_id = $3 ORDER BY c.date_chat DESC NULLS LAST, c.id_chat DESC`,
       [adminId, metaThemeId, roleFilter]
     );
 
@@ -2388,8 +2405,7 @@ app.post('/api/sos', async (req, res) => {
     await ensureSosTable();
     const result = await pool.query(
       `INSERT INTO sos_alerts (user_id, lat, lon, tour_name, role_label)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id_sos, created_at`,
+       VALUES ($1, $2, $3, $4, $5) RETURNING id_sos, created_at`,
       [userId || null, lat, lon, tourName || '', roleLabel || '']
     );
     let fio = 'Пользователь';
@@ -2415,12 +2431,8 @@ app.get('/api/admin/sos', async (req, res) => {
   try {
     await ensureSosTable();
     const { rows } = await pool.query(
-      `SELECT s.id_sos, s.lat, s.lon, s.tour_name, s.role_label, s.created_at,
-              u.fio, u.phone
-       FROM sos_alerts s
-       LEFT JOIN users u ON u.id_user = s.user_id
-       ORDER BY s.created_at DESC
-       LIMIT 100`
+      `SELECT s.id_sos, s.lat, s.lon, s.tour_name, s.role_label, s.created_at, u.fio, u.phone FROM sos_alerts s
+       LEFT JOIN users u ON u.id_user = s.user_id ORDER BY s.created_at DESC LIMIT 100`
     );
     res.json(rows);
   } catch (err) {
