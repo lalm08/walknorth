@@ -2365,35 +2365,64 @@ app.get('/api/admin/profile/:userId', async (req, res) => {
   }
 });
 
+async function ensureSosTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sos_alerts (
+      id_sos SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id_user) ON DELETE SET NULL,
+      lat DOUBLE PRECISION NOT NULL,
+      lon DOUBLE PRECISION NOT NULL,
+      tour_name TEXT,
+      role_label VARCHAR(50),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
+
 app.post('/api/sos', async (req, res) => {
   const { userId, lat, lon, tourName, roleLabel } = req.body;
   if (lat == null || lon == null) {
     return res.status(400).json({ error: 'Координаты обязательны' });
   }
   try {
+    await ensureSosTable();
+    const result = await pool.query(
+      `INSERT INTO sos_alerts (user_id, lat, lon, tour_name, role_label)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id_sos, created_at`,
+      [userId || null, lat, lon, tourName || '', roleLabel || '']
+    );
     let fio = 'Пользователь';
-    let phone = '';
     if (userId) {
-      const { rows } = await pool.query(
-        'SELECT fio, phone FROM users WHERE id_user = $1',
-        [userId]
-      );
-      if (rows.length > 0) {
-        fio = rows[0].fio || fio;
-        phone = rows[0].phone || '';
-      }
+      const { rows } = await pool.query('SELECT fio, phone FROM users WHERE id_user = $1', [userId]);
+      if (rows.length > 0) fio = rows[0].fio || fio;
     }
     const mapLink = `https://www.google.com/maps?q=${lat},${lon}`;
-    const text = [
-      'SOS-сигнал WalkNorth',
-      `От: ${fio} (${roleLabel || 'Пользователь'})`,
-      phone ? `Телефон: ${phone}` : null,
-      `Тур: ${tourName || '—'}`,
-      `Координаты: ${lat}, ${lon}`,
-      `Карта: ${mapLink}`
-    ].filter(Boolean).join('\n');
-    console.log('SOS ALERT:\n' + text);
-    res.json({ sent: false, logged: true, message: text });
+    console.log(`SOS #${result.rows[0].id_sos}: ${fio} (${roleLabel}) ${lat},${lon} — ${tourName}`);
+    res.json({
+      stored: true,
+      sent: true,
+      id_sos: result.rows[0].id_sos,
+      mapLink
+    });
+  } catch (err) {
+    console.error('SOS save failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/sos', async (req, res) => {
+  try {
+    await ensureSosTable();
+    const { rows } = await pool.query(
+      `SELECT s.id_sos, s.lat, s.lon, s.tour_name, s.role_label, s.created_at,
+              u.fio, u.phone
+       FROM sos_alerts s
+       LEFT JOIN users u ON u.id_user = s.user_id
+       ORDER BY s.created_at DESC
+       LIMIT 100`
+    );
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
