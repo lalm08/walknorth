@@ -102,12 +102,12 @@ async function getTourPlaces(tourId) {
   return [];
 }
 
-async function getOrsPath(points, profile) {
-  if (!points || points.length === 0) return [];
-  if (points.length === 1) {
-    return [{ lat: parseFloat(points[0].lat), lon: parseFloat(points[0].lon) }];
-  }
-  const coords = points.map(p => [parseFloat(p.lon), parseFloat(p.lat)]);
+async function getOrsLegPath(start, end, profile) {
+  const coords = [
+    [parseFloat(start.lon), parseFloat(start.lat)],
+    [parseFloat(end.lon), parseFloat(end.lat)]
+  ];
+  if (!process.env.ORS_API_KEY) return [];
   try {
     const orsResponse = await axios.post(
       `https://api.openrouteservice.org/v2/directions/${profile}/geojson`,
@@ -116,13 +116,62 @@ async function getOrsPath(points, profile) {
         headers: {
           Authorization: process.env.ORS_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 20000
       }
     );
     return orsResponse.data.features[0].geometry.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
   } catch (e) {
-    return points.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+    console.warn('ORS leg routing failed:', e.response?.data || e.message);
+    return [];
   }
+}
+
+async function getOsrmLegPath(start, end, profile) {
+  const osrmProfile = profile.includes('foot') ? 'foot' : 'driving';
+  const lon1 = parseFloat(start.lon);
+  const lat1 = parseFloat(start.lat);
+  const lon2 = parseFloat(end.lon);
+  const lat2 = parseFloat(end.lat);
+  const url = `https://router.project-osrm.org/route/v1/${osrmProfile}/${lon1},${lat1};${lon2},${lat2}?overview=full&geometries=geojson`;
+  try {
+    const res = await axios.get(url, { timeout: 20000 });
+    if (res.data.code !== 'Ok' || !res.data.routes?.[0]?.geometry?.coordinates) return [];
+    return res.data.routes[0].geometry.coordinates.map(c => ({ lat: c[1], lon: c[0] }));
+  } catch (e) {
+    console.warn('OSRM leg routing failed:', e.message);
+    return [];
+  }
+}
+
+async function getRoadPath(points, profile = 'driving-car') {
+  if (!points || points.length === 0) return [];
+  if (points.length === 1) {
+    return [{ lat: parseFloat(points[0].lat), lon: parseFloat(points[0].lon) }];
+  }
+
+  const merged = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const start = points[i];
+    const end = points[i + 1];
+    let leg = await getOrsLegPath(start, end, profile);
+    if (leg.length < 2) {
+      leg = await getOsrmLegPath(start, end, profile);
+    }
+    if (leg.length < 2) {
+      leg = [
+        { lat: parseFloat(start.lat), lon: parseFloat(start.lon) },
+        { lat: parseFloat(end.lat), lon: parseFloat(end.lon) }
+      ];
+    }
+    if (merged.length > 0) leg.shift();
+    merged.push(...leg);
+  }
+  return merged;
+}
+
+async function getOrsPath(points, profile) {
+  return getRoadPath(points, profile);
 }
 
 async function getRoutePathFromDb(routeId) {
@@ -526,7 +575,7 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
           type: 'car',
           label: 'Дорога на машине',
           points: carPoints,
-          path: await getOrsPath(carPoints, 'driving-car')
+          path: await getRoadPath(carPoints, 'driving-car')
         });
         segments.push({
           type: 'boat',
@@ -543,7 +592,7 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
           type: 'car',
           label: 'Дорога на машине',
           points: carPoints,
-          path: await getOrsPath(carPoints, 'driving-car')
+          path: await getRoadPath(carPoints, 'driving-car')
         });
         segments.push({
           type: 'boat',
@@ -554,10 +603,7 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
       }
     } else if (routeIds.length > 0) {
       const points = await getRoutePoints(routeIds[0]);
-      let path = await getRoutePathFromDb(routeIds[0]);
-      if (path.length === 0) {
-        path = await getOrsPath(points, 'driving-car');
-      }
+      const path = await getRoadPath(points, 'driving-car');
       segments.push({
         type: 'car',
         label: 'Маршрут на машине',
@@ -1838,9 +1884,6 @@ app.post('/api/chats/:chatId/messages', async (req, res) => {
 
     let messageText = String(text).trim();
     if (isSupport) {
-      if (!themeId) {
-        return res.status(400).json({ error: 'Выберите тему обращения' });
-      }
       let effectiveRoleId = Number(roleId);
       try {
         const { rows } = await pool.query('SELECT role_id FROM users WHERE id_user = $1', [userId]);
@@ -1848,19 +1891,25 @@ app.post('/api/chats/:chatId/messages', async (req, res) => {
       } catch (e) {
         console.warn('Message role lookup failed:', e.message);
       }
-      const range = supportTopicRange(effectiveRoleId);
-      const themeNum = Number(themeId);
-      if (themeNum < range.min || themeNum > range.max) {
-        return res.status(400).json({ error: 'Недопустимая тема обращения' });
+      const isAdminUser = effectiveRoleId >= 3;
+      if (!themeId && !isAdminUser) {
+        return res.status(400).json({ error: 'Выберите тему обращения' });
       }
-      const themeRes = await pool.query(
-        'SELECT name_theme FROM themes WHERE id_theme = $1',
-        [themeId]
-      );
-      if (themeRes.rows.length === 0) {
-        return res.status(400).json({ error: 'Тема не найдена' });
+      if (themeId) {
+        const range = supportTopicRange(effectiveRoleId);
+        const themeNum = Number(themeId);
+        if (themeNum < range.min || themeNum > range.max) {
+          return res.status(400).json({ error: 'Недопустимая тема обращения' });
+        }
+        const themeRes = await pool.query(
+          'SELECT name_theme FROM themes WHERE id_theme = $1',
+          [themeId]
+        );
+        if (themeRes.rows.length === 0) {
+          return res.status(400).json({ error: 'Тема не найдена' });
+        }
+        messageText = `[Тема: ${themeRes.rows[0].name_theme}]\n${messageText}`;
       }
-      messageText = `[Тема: ${themeRes.rows[0].name_theme}]\n${messageText}`;
     }
 
     const result = await pool.query(
@@ -1880,6 +1929,458 @@ app.post('/api/chats/:chatId/messages', async (req, res) => {
         is_mine: true,
         is_topic: String(row.text_message || '').startsWith('[Тема:')
       }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const GUIDE_STATUS_MAP = { active: 1, review: 3, suspended: 2 };
+
+async function getLatestGuideStatusId(guideId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT status_verification_id FROM guide_verifications
+       WHERE guide_id = $1 ORDER BY id_verification DESC LIMIT 1`,
+      [guideId]
+    );
+    return rows.length > 0 ? rows[0].status_verification_id : 3;
+  } catch (e) {
+    return 3;
+  }
+}
+
+function guideStatusApiFromId(statusId) {
+  if (statusId === 1) return 'active';
+  if (statusId === 3) return 'review';
+  if (statusId === 2) return 'suspended';
+  return 'review';
+}
+
+async function extractSupportTopic(chatId) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.text_message FROM messages m
+       JOIN participants_chats pc ON m.participant_id = pc.id_participant
+       WHERE pc.chat_id = $1 AND m.text_message LIKE '[Тема:%'
+       ORDER BY m.id_message ASC LIMIT 1`,
+      [chatId]
+    );
+    if (rows.length === 0) return '';
+    const text = String(rows[0].text_message || '');
+    const match = text.match(/^\[Тема:\s*(.+?)\]/);
+    return match ? match[1].trim() : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+app.get('/api/admin/guides', async (req, res) => {
+  const statusId = req.query.status === 'review' ? 3 : 1;
+  const q = String(req.query.q || '').trim().toLowerCase();
+  try {
+    const { rows } = await pool.query(
+      `SELECT gp.id_guide, u.id_user, u.fio, u.phone,
+              COALESCE(lv.status_verification_id, 3) AS status_id,
+              sv.name_status_verification AS status_name
+       FROM guide_profiles gp
+       JOIN users u ON u.id_user = gp.user_id
+       LEFT JOIN LATERAL (
+         SELECT status_verification_id FROM guide_verifications
+         WHERE guide_id = gp.id_guide
+         ORDER BY id_verification DESC LIMIT 1
+       ) lv ON true
+       LEFT JOIN status_verifications sv ON sv.id_status_verification = COALESCE(lv.status_verification_id, 3)
+       WHERE COALESCE(lv.status_verification_id, 3) = $1
+         AND ($2 = '' OR LOWER(u.fio) LIKE '%' || $2 || '%')
+       ORDER BY u.fio`,
+      [statusId, q]
+    );
+    res.json(rows.map(r => ({
+      id_guide: r.id_guide,
+      user_id: r.id_user,
+      fio: r.fio,
+      phone: r.phone || '',
+      status: guideStatusApiFromId(r.status_id),
+      status_name: r.status_name || ''
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/guides/:guideId', async (req, res) => {
+  const guideId = req.params.guideId;
+  try {
+    const profileRes = await pool.query(
+      `SELECT gp.id_guide, u.id_user, u.fio, u.phone, u.mail,
+              gp.bio, gp.experience, gp.social_link,
+              COALESCE(lv.status_verification_id, 3) AS status_id,
+              sv.name_status_verification AS status_name
+       FROM guide_profiles gp
+       JOIN users u ON u.id_user = gp.user_id
+       LEFT JOIN LATERAL (
+         SELECT status_verification_id FROM guide_verifications
+         WHERE guide_id = gp.id_guide
+         ORDER BY id_verification DESC LIMIT 1
+       ) lv ON true
+       LEFT JOIN status_verifications sv ON sv.id_status_verification = COALESCE(lv.status_verification_id, 3)
+       WHERE gp.id_guide = $1`,
+      [guideId]
+    );
+    if (profileRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Гид не найден' });
+    }
+    const profile = profileRes.rows[0];
+
+    let organizations = [];
+    try {
+      const orgRes = await pool.query(
+        `SELECT DISTINCT o.name_organization
+         FROM organization_users ou
+         JOIN organizations o ON o.id_organization = ou.organization_id
+         WHERE ou.user_id = $1`,
+        [profile.id_user]
+      );
+      organizations = orgRes.rows.map(r => r.name_organization).filter(Boolean);
+    } catch (e) {
+      console.warn('Guide org lookup failed:', e.message);
+    }
+
+    let tours = [];
+    try {
+      const toursRes = await pool.query(
+        `SELECT t.id_tour, t.name_tour
+         FROM guides_and_tours gt
+         JOIN tours t ON t.id_tour = gt.tour_id
+         WHERE gt.guide_id = $1
+         ORDER BY t.name_tour`,
+        [guideId]
+      );
+      tours = toursRes.rows;
+    } catch (e) {
+      console.warn('Guide tours lookup failed:', e.message);
+    }
+
+    res.json({
+      id_guide: profile.id_guide,
+      user_id: profile.id_user,
+      fio: profile.fio,
+      phone: profile.phone || '',
+      mail: profile.mail || '',
+      social_link: profile.social_link || '',
+      bio: profile.bio || '',
+      experience: profile.experience || '',
+      organizations,
+      tours: tours.map(t => ({ id_tour: t.id_tour, name: t.name_tour })),
+      status: guideStatusApiFromId(profile.status_id),
+      status_name: profile.status_name || ''
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/guides/:guideId/status', async (req, res) => {
+  const guideId = req.params.guideId;
+  const { adminId, status } = req.body;
+  const statusId = GUIDE_STATUS_MAP[status];
+  if (!statusId) {
+    return res.status(400).json({ error: 'Недопустимый статус' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO guide_verifications (guide_id, admin_id, status_verification_id)
+       VALUES ($1, $2, $3)`,
+      [guideId, adminId || null, statusId]
+    );
+    res.json({ success: true, status });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/content', async (req, res) => {
+  const type = req.query.type || 'places';
+  const offset = parseInt(req.query.offset, 10) || 0;
+  const limit = parseInt(req.query.limit, 10) || 20;
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const districts = req.query.districts;
+  let sql;
+  const params = [limit, offset, q];
+
+  if (type === 'places') {
+    sql = `SELECT DISTINCT ON (p.id_place) p.id_place AS id, p.name_place AS name, ph.photo_binary
+           FROM places p
+           LEFT JOIN photos ph ON p.id_place = ph.place_id
+           WHERE ($3 = '' OR LOWER(p.name_place) LIKE '%' || $3 || '%')`;
+    if (districts) {
+      const ids = districts.split(',').map(d => parseInt(d, 10)).filter(Boolean);
+      if (ids.length > 0) {
+        sql += ` AND p.district_id IN (${ids.map((_, i) => '$' + (i + 4)).join(',')})`;
+        params.push(...ids);
+      }
+    }
+    sql += ` ORDER BY p.id_place LIMIT $1 OFFSET $2`;
+  } else if (type === 'routes') {
+    sql = `SELECT r.id_route AS id, r.name_route AS name,
+           (SELECT photo_binary FROM photos ph
+            JOIN place_and_route pr ON ph.place_id = pr.place_id
+            WHERE pr.route_id = r.id_route LIMIT 1) AS photo_binary
+           FROM routes r
+           WHERE ($3 = '' OR LOWER(r.name_route) LIKE '%' || $3 || '%')`;
+    if (districts) {
+      const ids = districts.split(',').map(d => parseInt(d, 10)).filter(Boolean);
+      if (ids.length > 0) {
+        sql += ` AND EXISTS (
+          SELECT 1 FROM place_and_route par
+          JOIN places pl ON par.place_id = pl.id_place
+          WHERE par.route_id = r.id_route AND pl.district_id IN (${ids.map((_, i) => '$' + (i + 4)).join(',')})
+        )`;
+        params.push(...ids);
+      }
+    }
+    sql += ` ORDER BY r.name_route LIMIT $1 OFFSET $2`;
+  } else {
+    sql = `SELECT DISTINCT t.id_tour AS id, t.name_tour AS name, t.photo_binary
+           FROM tours t
+           JOIN route_and_tour rat ON t.id_tour = rat.tour_id
+           JOIN place_and_route par ON rat.route_id = par.route_id
+           JOIN places p ON par.place_id = p.id_place
+           WHERE ($3 = '' OR LOWER(t.name_tour) LIKE '%' || $3 || '%')`;
+    if (districts) {
+      const ids = districts.split(',').map(d => parseInt(d, 10)).filter(Boolean);
+      if (ids.length > 0) {
+        sql += ` AND p.district_id IN (${ids.map((_, i) => '$' + (i + 4)).join(',')})`;
+        params.push(...ids);
+      }
+    }
+    sql += ` ORDER BY t.name_tour LIMIT $1 OFFSET $2`;
+  }
+
+  try {
+    const result = await pool.query(sql, params);
+    const data = await formatRows(result.rows, 300);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/content/place/:id', async (req, res) => {
+  const id = req.params.id;
+  try {
+    const { rows } = await pool.query(
+      `SELECT p.id_place, p.name_place, p.description, p.address,
+              d.name_district, tp.name_type_place AS type_name,
+              ST_Y(p.location::geometry) AS lat,
+              ST_X(p.location::geometry) AS lon
+       FROM places p
+       LEFT JOIN districts d ON d.id_district = p.district_id
+       LEFT JOIN types_places tp ON tp.id_type_place = p.type_place_id
+       WHERE p.id_place = $1`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Место не найдено' });
+    const row = rows[0];
+    res.json({
+      type: 'place',
+      id: row.id_place,
+      name: row.name_place,
+      district: row.name_district || '',
+      description: row.description || '',
+      address: row.address || '',
+      type_name: row.type_name || '',
+      lat: row.lat != null ? parseFloat(row.lat) : null,
+      lon: row.lon != null ? parseFloat(row.lon) : null
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/content/route/:id', async (req, res) => {
+  const id = req.params.id;
+  try {
+    const meta = await pool.query(
+      `SELECT r.name_route, r.description, r.duration::text AS duration,
+              string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
+       FROM routes r
+       LEFT JOIN place_and_route par ON par.route_id = r.id_route
+       LEFT JOIN places p ON p.id_place = par.place_id
+       LEFT JOIN districts d ON d.id_district = p.district_id
+       WHERE r.id_route = $1
+       GROUP BY r.id_route, r.name_route, r.description, r.duration`,
+      [id]
+    );
+    if (meta.rows.length === 0) return res.status(404).json({ error: 'Маршрут не найден' });
+    const row = meta.rows[0];
+    const points = await getRoutePoints(id);
+    const path = await getRoadPath(points, 'driving-car');
+    res.json({
+      type: 'route',
+      id: parseInt(id, 10),
+      name: row.name_route,
+      districts: row.districts || '',
+      description: row.description || '',
+      duration: row.duration || '',
+      points,
+      path
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/content/tour/:id', async (req, res) => {
+  const tourId = parseInt(req.params.id, 10);
+  try {
+    const meta = await getToursTableMeta();
+    const durationSelect = meta.durationCol
+      ? `, ${meta.durationCol}::text AS duration`
+      : ", NULL AS duration";
+    const tourRes = await pool.query(
+      `SELECT t.id_tour, t.name_tour, t.description, t.price,
+              t.season_start, t.season_end, t.max_people${durationSelect}
+       FROM tours t WHERE t.id_tour = $1`,
+      [tourId]
+    );
+    if (tourRes.rows.length === 0) return res.status(404).json({ error: 'Тур не найден' });
+    const tour = tourRes.rows[0];
+
+    let districts = '';
+    try {
+      const distRes = await pool.query(
+        `SELECT string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
+         FROM route_and_tour rat
+         JOIN place_and_route par ON par.route_id = rat.route_id
+         JOIN places p ON p.id_place = par.place_id
+         JOIN districts d ON d.id_district = p.district_id
+         WHERE rat.tour_id = $1`,
+        [tourId]
+      );
+      districts = distRes.rows[0]?.districts || '';
+    } catch (e) {
+      console.warn('Tour districts failed:', e.message);
+    }
+
+    let places = [];
+    try {
+      places = await getTourPlaces(tourId);
+    } catch (e) {
+      console.warn('Tour places failed:', e.message);
+    }
+
+    const routeQueries = [
+      `SELECT r.id_route FROM route_and_tour rat
+       JOIN routes r ON rat.route_id = r.id_route WHERE rat.tour_id = $1 ORDER BY r.id_route`,
+      `SELECT r.id_route FROM route_and_tour rat
+       JOIN routes r ON rat.route_id = r.id_route WHERE rat.tour = $1 ORDER BY r.id_route`
+    ];
+    let routeIds = [];
+    for (const sql of routeQueries) {
+      try {
+        const routesRes = await pool.query(sql, [tourId]);
+        if (routesRes.rows.length > 0) {
+          routeIds = routesRes.rows.map(r => r.id_route);
+          break;
+        }
+      } catch (e) {
+        console.warn('Tour routes query failed:', e.message);
+      }
+    }
+
+    const isRiverTour = tourId >= 5 && tourId <= 7;
+    const segments = [];
+    if (isRiverTour && routeIds.length >= 2) {
+      const carPoints = await getRoutePoints(routeIds[0]);
+      const boatPoints = await getRoutePoints(routeIds[1]);
+      let boatPath = await getRoutePathFromDb(routeIds[1]);
+      if (boatPath.length === 0) {
+        boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+      }
+      segments.push({ type: 'car', label: 'Дорога на машине', points: carPoints, path: await getRoadPath(carPoints, 'driving-car') });
+      segments.push({ type: 'boat', label: 'Сплав на лодке', points: boatPoints, path: boatPath });
+    } else if (routeIds.length > 0) {
+      const points = await getRoutePoints(routeIds[0]);
+      segments.push({
+        type: 'car',
+        label: 'Маршрут на машине',
+        points,
+        path: await getRoadPath(points, 'driving-car')
+      });
+    }
+
+    res.json({
+      type: 'tour',
+      id: tour.id_tour,
+      name: tour.name_tour,
+      districts,
+      description: tour.description || '',
+      price: tour.price,
+      duration: formatTourDuration(tour.duration),
+      season_start: tour.season_start,
+      season_end: tour.season_end,
+      max_people: tour.max_people,
+      places: places.map(p => ({ id: p.id_place, name: p.name_place || p.name })),
+      segments
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/chats', async (req, res) => {
+  const adminId = req.query.adminId;
+  const type = req.query.type === 'guides' ? 'guides' : 'clients';
+  const roleFilter = type === 'guides' ? 2 : 1;
+  if (!adminId) {
+    return res.status(400).json({ error: 'adminId обязателен' });
+  }
+  try {
+    const metaThemeId = await findSupportMetaThemeId();
+    if (!metaThemeId) return res.json([]);
+
+    const { rows } = await pool.query(
+      `SELECT c.id_chat, c.date_chat, u.fio, u.role_id, u.id_user
+       FROM chats c
+       JOIN participants_chats pc_admin ON pc_admin.chat_id = c.id_chat AND pc_admin.user_id = $1
+       JOIN participants_chats pc_other ON pc_other.chat_id = c.id_chat AND pc_other.user_id <> $1
+       JOIN users u ON u.id_user = pc_other.user_id
+       WHERE c.theme = $2 AND u.role_id = $3
+       ORDER BY c.date_chat DESC NULLS LAST, c.id_chat DESC`,
+      [adminId, metaThemeId, roleFilter]
+    );
+
+    const result = [];
+    for (const row of rows) {
+      const topic = await extractSupportTopic(row.id_chat);
+      result.push({
+        id_chat: row.id_chat,
+        partner_name: row.fio || 'Пользователь',
+        partner_id: row.id_user,
+        topic: topic || 'Обращение в поддержку',
+        date_chat: row.date_chat,
+        is_support: true
+      });
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/profile/:userId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT fio, phone, mail FROM users WHERE id_user = $1',
+      [req.params.userId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Пользователь не найден' });
+    res.json({
+      name: rows[0].fio || '',
+      phone: rows[0].phone || '',
+      mail: rows[0].mail || ''
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
