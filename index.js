@@ -28,36 +28,41 @@ app.use(express.json());
 // Подключение к БД
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 5
 });
 
-const formatRows = async (rows, width = 300) => {
-  return await Promise.all(rows.map(async (row) => {
-    const newRow = { ...row };
-    for (let key in newRow) {
-      if (Buffer.isBuffer(newRow[key])) {
-        try {
-          let pipeline = sharp(newRow[key])
-            .resize(width, null, {
-              fit: 'inside',     
-              withoutEnlargement: true 
-            });
+sharp.cache({ memory: 32, files: 0, items: 16 });
+sharp.concurrency(1);
 
-          if (width <= 200) {
-            const buffer = await pipeline.png().toBuffer();
-            newRow[key] = buffer.toString('base64');
-          } else {
-            const buffer = await pipeline.webp({ quality: 70 }).toBuffer();
-            newRow[key] = buffer.toString('base64');
-          }
-        } catch (e) {
-          console.error("Ошибка обработки изображения:", e);
-          newRow[key] = null; 
-        }
+async function compressPhotoBuffer(buffer, width = 300) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+  try {
+    const pipeline = sharp(buffer, { sequentialRead: true, failOn: 'none' })
+      .rotate()
+      .resize(width, null, { fit: 'inside', withoutEnlargement: true });
+    const out = width <= 180
+      ? await pipeline.jpeg({ quality: 72, mozjpeg: true }).toBuffer()
+      : await pipeline.webp({ quality: 60 }).toBuffer();
+    return out.toString('base64');
+  } catch (e) {
+    console.error('Ошибка обработки изображения:', e.message);
+    return null;
+  }
+}
+
+const formatRows = async (rows, width = 300) => {
+  const result = [];
+  for (const row of rows) {
+    const newRow = { ...row };
+    for (const key of Object.keys(newRow)) {
+      if (Buffer.isBuffer(newRow[key])) {
+        newRow[key] = await compressPhotoBuffer(newRow[key], width);
       }
     }
-    return newRow;
-  }));
+    result.push(newRow);
+  }
+  return result;
 };
 
 async function getRoutePoints(routeId) {
@@ -388,8 +393,8 @@ app.get('/api/main-data', async (req, res) => {
     const [districtsRes, nearbyRes, pickedRes] = await Promise.all([
       districtsPromise, nearbyPromise, pickedPromise
     ]);
-    const compressedDistricts = await formatRows(districtsRes.rows, 150);
-    const compressedNearby = await formatRows(nearbyRes.rows, 350);
+    const compressedDistricts = await formatRows(districtsRes.rows, 120);
+    const compressedNearby = await formatRows(nearbyRes.rows, 220);
 
     res.json({
       districts: compressedDistricts,
@@ -585,11 +590,15 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
       const carPoints = await getRoutePoints(routeIds[0]);
       const boatPoints = await getRoutePoints(routeIds[1]);
       const boatPath = boatPoints.map(p => ({ lat: parseFloat(p.lat), lon: parseFloat(p.lon) }));
+      let carPath = await getRoutePathFromDb(routeIds[0]);
+      if (carPath.length < 2) {
+        carPath = await getRoadPath(carPoints, 'driving-car');
+      }
       segments.push({
         type: 'car',
         label: 'Дорога на машине',
         points: carPoints,
-        path: await getRoadPath(carPoints, 'driving-car')
+        path: carPath
       });
       segments.push({
         type: 'boat',
@@ -599,11 +608,15 @@ app.get('/api/tour-map/:tourId', async (req, res) => {
       });
     } else if (routeIds.length > 0) {
       const points = await getRoutePoints(routeIds[0]);
+      let path = await getRoutePathFromDb(routeIds[0]);
+      if (path.length < 2) {
+        path = await getRoadPath(points, 'driving-car');
+      }
       segments.push({
         type: 'car',
         label: 'Маршрут на машине',
         points,
-        path: await getRoadPath(points, 'driving-car')
+        path
       });
     }
 
@@ -975,7 +988,7 @@ app.get('/api/explore', async (req, res) => {
 
   try {
     const result = await pool.query(sql, params);
-    const data = await formatRows(result.rows, 300);
+    const data = await formatRows(result.rows, 180);
     res.json(data);
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
@@ -1946,7 +1959,8 @@ const GUIDE_STATUS_MAP = { active: 1, review: 3, suspended: 2 };
 async function getLatestGuideStatusId(guideId) {
   try {
     const { rows } = await pool.query(
-      `SELECT status_verification_id FROM guide_verifications WHERE guide_id = $1 ORDER BY id_verification DESC LIMIT 1`,
+      `SELECT status_verification_id FROM guide_verifications
+       WHERE guide_id = $1 ORDER BY id_verification DESC LIMIT 1`,
       [guideId]
     );
     return rows.length > 0 ? rows[0].status_verification_id : 3;
@@ -2041,7 +2055,8 @@ app.get('/api/admin/guides/:guideId', async (req, res) => {
     let organizations = [];
     try {
       const orgRes = await pool.query(
-        `SELECT DISTINCT o.name_organization FROM organization_users ou
+        `SELECT DISTINCT o.name_organization
+         FROM organization_users ou
          JOIN organizations o ON o.id_organization = ou.organization_id
          WHERE ou.user_id = $1`,
         [profile.id_user]
@@ -2054,9 +2069,11 @@ app.get('/api/admin/guides/:guideId', async (req, res) => {
     let tours = [];
     try {
       const toursRes = await pool.query(
-        `SELECT t.id_tour, t.name_tour FROM guides_and_tours gt
+        `SELECT t.id_tour, t.name_tour
+         FROM guides_and_tours gt
          JOIN tours t ON t.id_tour = gt.tour_id
-         WHERE gt.guide_id = $1 ORDER BY t.name_tour`,
+         WHERE gt.guide_id = $1
+         ORDER BY t.name_tour`,
         [guideId]
       );
       tours = toursRes.rows;
@@ -2112,7 +2129,8 @@ app.get('/api/admin/content', async (req, res) => {
   const params = [limit, offset, q];
 
   if (type === 'places') {
-    sql = `SELECT DISTINCT ON (p.id_place) p.id_place AS id, p.name_place AS name, ph.photo_binary FROM places p
+    sql = `SELECT DISTINCT ON (p.id_place) p.id_place AS id, p.name_place AS name, ph.photo_binary
+           FROM places p
            LEFT JOIN photos ph ON p.id_place = ph.place_id
            WHERE ($3 = '' OR LOWER(p.name_place) LIKE '%' || $3 || '%')`;
     if (districts) {
@@ -2128,7 +2146,8 @@ app.get('/api/admin/content', async (req, res) => {
            (SELECT photo_binary FROM photos ph
             JOIN place_and_route pr ON ph.place_id = pr.place_id
             WHERE pr.route_id = r.id_route LIMIT 1) AS photo_binary
-           FROM routes r WHERE ($3 = '' OR LOWER(r.name_route) LIKE '%' || $3 || '%')`;
+           FROM routes r
+           WHERE ($3 = '' OR LOWER(r.name_route) LIKE '%' || $3 || '%')`;
     if (districts) {
       const ids = districts.split(',').map(d => parseInt(d, 10)).filter(Boolean);
       if (ids.length > 0) {
@@ -2203,12 +2222,14 @@ app.get('/api/admin/content/route/:id', async (req, res) => {
   const id = req.params.id;
   try {
     const meta = await pool.query(
-      `SELECT r.name_route, r.description, r.duration::text AS duration, string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
+      `SELECT r.name_route, r.description, r.duration::text AS duration,
+              string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
        FROM routes r
        LEFT JOIN place_and_route par ON par.route_id = r.id_route
        LEFT JOIN places p ON p.id_place = par.place_id
        LEFT JOIN districts d ON d.id_district = p.district_id
-       WHERE r.id_route = $1 GROUP BY r.id_route, r.name_route, r.description, r.duration`,
+       WHERE r.id_route = $1
+       GROUP BY r.id_route, r.name_route, r.description, r.duration`,
       [id]
     );
     if (meta.rows.length === 0) return res.status(404).json({ error: 'Маршрут не найден' });
@@ -2238,7 +2259,8 @@ app.get('/api/admin/content/tour/:id', async (req, res) => {
       ? `, ${meta.durationCol}::text AS duration`
       : ", NULL AS duration";
     const tourRes = await pool.query(
-      `SELECT t.id_tour, t.name_tour, t.description, t.price, t.season_start, t.season_end, t.max_people${durationSelect}
+      `SELECT t.id_tour, t.name_tour, t.description, t.price,
+              t.season_start, t.season_end, t.max_people${durationSelect}
        FROM tours t WHERE t.id_tour = $1`,
       [tourId]
     );
@@ -2248,7 +2270,8 @@ app.get('/api/admin/content/tour/:id', async (req, res) => {
     let districts = '';
     try {
       const distRes = await pool.query(
-        `SELECT string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts FROM route_and_tour rat
+        `SELECT string_agg(DISTINCT d.name_district, ', ' ORDER BY d.name_district) AS districts
+         FROM route_and_tour rat
          JOIN place_and_route par ON par.route_id = rat.route_id
          JOIN places p ON p.id_place = par.place_id
          JOIN districts d ON d.id_district = p.district_id
@@ -2339,11 +2362,13 @@ app.get('/api/admin/chats', async (req, res) => {
     if (!metaThemeId) return res.json([]);
 
     const { rows } = await pool.query(
-      `SELECT c.id_chat, c.date_chat, u.fio, u.role_id, u.id_user FROM chats c
+      `SELECT c.id_chat, c.date_chat, u.fio, u.role_id, u.id_user
+       FROM chats c
        JOIN participants_chats pc_admin ON pc_admin.chat_id = c.id_chat AND pc_admin.user_id = $1
        JOIN participants_chats pc_other ON pc_other.chat_id = c.id_chat AND pc_other.user_id <> $1
        JOIN users u ON u.id_user = pc_other.user_id
-       WHERE c.theme = $2 AND u.role_id = $3 ORDER BY c.date_chat DESC NULLS LAST, c.id_chat DESC`,
+       WHERE c.theme = $2 AND u.role_id = $3
+       ORDER BY c.date_chat DESC NULLS LAST, c.id_chat DESC`,
       [adminId, metaThemeId, roleFilter]
     );
 
@@ -2405,7 +2430,8 @@ app.post('/api/sos', async (req, res) => {
     await ensureSosTable();
     const result = await pool.query(
       `INSERT INTO sos_alerts (user_id, lat, lon, tour_name, role_label)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id_sos, created_at`,
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id_sos, created_at`,
       [userId || null, lat, lon, tourName || '', roleLabel || '']
     );
     let fio = 'Пользователь';
@@ -2431,8 +2457,12 @@ app.get('/api/admin/sos', async (req, res) => {
   try {
     await ensureSosTable();
     const { rows } = await pool.query(
-      `SELECT s.id_sos, s.lat, s.lon, s.tour_name, s.role_label, s.created_at, u.fio, u.phone FROM sos_alerts s
-       LEFT JOIN users u ON u.id_user = s.user_id ORDER BY s.created_at DESC LIMIT 100`
+      `SELECT s.id_sos, s.lat, s.lon, s.tour_name, s.role_label, s.created_at,
+              u.fio, u.phone
+       FROM sos_alerts s
+       LEFT JOIN users u ON u.id_user = s.user_id
+       ORDER BY s.created_at DESC
+       LIMIT 100`
     );
     res.json(rows);
   } catch (err) {
