@@ -477,15 +477,7 @@ app.get('/api/tour-details/:id', async (req, res) => {
     let reviews = [];
     let avgRating = 0;
     try {
-      const reviewsRes = await pool.query(
-        `SELECT u.fio AS user_name, rev.rating, rev.text_review AS text
-         FROM reviews rev
-         JOIN users u ON rev.user_id = u.id_user
-         WHERE rev.tour_id = $1
-         ORDER BY rev.id_review DESC`,
-        [tourId]
-      );
-      reviews = reviewsRes.rows;
+      reviews = await getTourReviews(tourId);
       if (reviews.length > 0) {
         avgRating = reviews.reduce((sum, r) => sum + Number(r.rating), 0) / reviews.length;
         avgRating = Math.round(avgRating * 10) / 10;
@@ -658,9 +650,13 @@ function groupClientBookings(rows) {
   const map = new Map();
   for (const row of rows) {
     const key = `${row.name_tour}|${normalizeScheduleKey(row.datetime_start)}`;
+    const hasReview = row.id_review != null;
+    const canCancel = isFutureSchedule({ datetime_start: row.datetime_start });
     if (map.has(key)) {
       const existing = map.get(key);
       existing.count_people = (existing.count_people || 1) + (row.count_people || 1);
+      existing.has_review = existing.has_review || hasReview;
+      existing.can_review = !existing.can_cancel && !existing.has_review;
     } else {
       map.set(key, {
         id_booking: row.id_booking,
@@ -670,13 +666,45 @@ function groupClientBookings(rows) {
         datetime_start: row.datetime_start,
         datetime_end: row.datetime_end,
         count_people: row.count_people || 1,
-        can_cancel: isFutureSchedule({ datetime_start: row.datetime_start })
+        can_cancel: canCancel,
+        has_review: hasReview,
+        can_review: !canCancel && !hasReview
       });
     }
   }
   return Array.from(map.values()).sort(
     (a, b) => new Date(b.datetime_start) - new Date(a.datetime_start)
   );
+}
+
+async function getTourReviews(tourId) {
+  const variants = [
+    `SELECT u.fio AS user_name, rev.rating, rev.comment AS text
+     FROM reviews rev
+     JOIN bookings b ON rev.booking_id = b.id_booking
+     JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+     JOIN tours t ON ts.tour = t.id_tour
+     JOIN users u ON b.user_id = u.id_user
+     WHERE t.id_tour = $1
+     ORDER BY rev.id_review DESC`,
+    `SELECT u.fio AS user_name, rev.rating, COALESCE(rev.comment, rev.text_review) AS text
+     FROM reviews rev
+     JOIN bookings b ON rev.booking_id = b.id_booking
+     JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule
+     JOIN tours t ON ts.tour_id = t.id_tour
+     JOIN users u ON b.user_id = u.id_user
+     WHERE t.id_tour = $1
+     ORDER BY rev.id_review DESC`
+  ];
+  for (const sql of variants) {
+    try {
+      const { rows } = await pool.query(sql, [tourId]);
+      return rows;
+    } catch (e) {
+      console.warn('Tour reviews query failed:', e.message);
+    }
+  }
+  return [];
 }
 
 function groupGuideBookings(rows) {
@@ -853,6 +881,81 @@ app.post('/api/bookings/cancel', async (req, res) => {
   }
 });
 
+app.post('/api/reviews', async (req, res) => {
+  const { userId, bookingId, rating, text } = req.body;
+  if (!userId || userId === -1 || !bookingId) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+  const ratingNum = Number(rating);
+  if (!Number.isInteger(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+    return res.status(400).json({ error: 'Оценка должна быть от 1 до 5' });
+  }
+  const comment = String(text || '').trim();
+  if (!comment) {
+    return res.status(400).json({ error: 'Введите текст отзыва' });
+  }
+
+  const bookingVariants = [
+    {
+      join: 'JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule',
+      tourJoin: 'JOIN tours t ON ts.tour = t.id_tour'
+    },
+    {
+      join: 'JOIN tours_schedule ts ON b.tour_schedule = ts.id_tour_schedule',
+      tourJoin: 'JOIN tours t ON ts.tour_id = t.id_tour'
+    }
+  ];
+
+  try {
+    let bookingRow = null;
+    for (const variant of bookingVariants) {
+      try {
+        const { rows } = await pool.query(
+          `SELECT b.id_booking, b.user_id, ts.datetime_start, rev.id_review
+           FROM bookings b
+           ${variant.join}
+           ${variant.tourJoin}
+           LEFT JOIN reviews rev ON rev.booking_id = b.id_booking
+           WHERE b.id_booking = $1 AND b.user_id = $2`,
+          [bookingId, userId]
+        );
+        if (rows.length > 0) {
+          bookingRow = rows[0];
+          break;
+        }
+      } catch (e) {
+        console.warn('Review booking lookup failed:', e.message);
+      }
+    }
+
+    if (!bookingRow) {
+      return res.status(404).json({ error: 'Бронирование не найдено' });
+    }
+    if (isFutureSchedule({ datetime_start: bookingRow.datetime_start })) {
+      return res.status(400).json({ error: 'Отзыв можно оставить только после тура' });
+    }
+    if (bookingRow.id_review) {
+      return res.status(400).json({ error: 'Отзыв уже оставлен' });
+    }
+
+    const insertVariants = [
+      'INSERT INTO reviews (booking_id, rating, comment) VALUES ($1, $2, $3) RETURNING id_review',
+      'INSERT INTO reviews (booking_id, rating, text_review) VALUES ($1, $2, $3) RETURNING id_review'
+    ];
+    for (const sql of insertVariants) {
+      try {
+        const result = await pool.query(sql, [bookingId, ratingNum, comment]);
+        return res.json({ success: true, id_review: result.rows[0].id_review });
+      } catch (e) {
+        console.warn('Review insert failed:', e.message);
+      }
+    }
+    return res.status(500).json({ error: 'Не удалось сохранить отзыв' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/bookings/:userId', async (req, res) => {
   const variants = [
     {
@@ -873,10 +976,12 @@ app.get('/api/bookings/:userId', async (req, res) => {
       try {
         const result = await pool.query(
           `SELECT b.id_booking, t.id_tour, t.name_tour, t.price,
-                  ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking
+                  ts.datetime_start, ts.datetime_end, b.count_people, b.date_booking,
+                  rev.id_review
            FROM bookings b
            JOIN tours_schedule ts ON ${variant.scheduleCol}
            ${variant.join}
+           LEFT JOIN reviews rev ON rev.booking_id = b.id_booking
            WHERE b.user_id = $1
            ORDER BY ts.datetime_start DESC`,
           [req.params.userId]
