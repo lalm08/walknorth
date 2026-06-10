@@ -711,9 +711,14 @@ function groupGuideBookings(rows) {
   const map = new Map();
   for (const row of rows) {
     const key = `${row.name_tour}|${normalizeScheduleKey(row.datetime_start)}`;
+    const clientEntry = {
+      name: row.client_name || 'Клиент',
+      count_people: row.count_people || 1
+    };
     if (map.has(key)) {
       const existing = map.get(key);
       existing.count_people = (existing.count_people || 1) + (row.count_people || 1);
+      existing.clients.push(clientEntry);
     } else {
       map.set(key, {
         id_booking: row.id_booking,
@@ -721,7 +726,8 @@ function groupGuideBookings(rows) {
         name_tour: row.name_tour,
         datetime_start: row.datetime_start,
         count_people: row.count_people || 1,
-        client_name: row.client_name || 'Клиент'
+        client_name: row.client_name || 'Клиент',
+        clients: [clientEntry]
       });
     }
   }
