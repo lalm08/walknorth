@@ -25,11 +25,14 @@ const axios = require('axios');
 
 app.use(express.json());
 
-// Подключение к БД
+// Подключение к БД (Neon / Supabase / Render Postgres)
+const dbUrl = process.env.DATABASE_URL || '';
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5
+  connectionString: dbUrl,
+  ssl: dbUrl.includes('localhost') ? false : { rejectUnauthorized: false },
+  max: process.env.VERCEL ? 2 : 5,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 15000
 });
 
 sharp.cache({ memory: 32, files: 0, items: 16 });
@@ -2581,4 +2584,8 @@ app.get('/api/admin/sos', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+module.exports = app;
+
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
